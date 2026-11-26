@@ -283,6 +283,126 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await alice_writer.wait_closed()
         await bob_writer.wait_closed()
 
+    async def test_history_survives_reconnect_for_all_chat_types(self) -> None:
+        alice_reader, alice_writer = await self.authenticate(
+            "register", "Alice", "alice"
+        )
+        await read_packet(alice_reader)
+        bob_reader, bob_writer = await self.authenticate("register", "Bob", "bob")
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        await write_packet(
+            alice_writer,
+            {"type": "chat_message", "request_id": "general-1", "text": "general"},
+        )
+        await read_packet(alice_reader)
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "private_message",
+                "request_id": "private-1",
+                "recipient": "Bob",
+                "text": "private",
+            },
+        )
+        await read_packet(alice_reader)
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "create_channel",
+                "request_id": "create-1",
+                "channel": "Developers",
+            },
+        )
+        await read_packet(alice_reader)
+        await write_packet(
+            alice_writer,
+            {
+                "type": "channel_message",
+                "request_id": "channel-1",
+                "channel": "Developers",
+                "text": "channel",
+            },
+        )
+        await read_packet(alice_reader)
+        await read_packet(alice_reader)
+
+        alice_writer.close()
+        bob_writer.close()
+        await alice_writer.wait_closed()
+        await bob_writer.wait_closed()
+        await self.wait_until_offline()
+
+        history_reader, history_writer = await self.authenticate(
+            "login", "Alice", "login"
+        )
+        await read_packet(history_reader)
+
+        for chat_type, target, expected_text in (
+            ("general", "general", "general"),
+            ("private", "bob", "private"),
+            ("channel", "developers", "channel"),
+        ):
+            await write_packet(
+                history_writer,
+                {
+                    "type": "get_history",
+                    "request_id": f"history-{chat_type}",
+                    "chat_type": chat_type,
+                    "target": target,
+                },
+            )
+            response = await read_packet(history_reader)
+            self.assertEqual(response["action"], "get_history")
+            self.assertEqual(response["messages"][-1]["text"], expected_text)
+
+        await write_packet(
+            history_writer,
+            {"type": "list_chats", "request_id": "chats-after-reconnect"},
+        )
+        chats = (await read_packet(history_reader))["chats"]
+        self.assertTrue(
+            any(chat["type"] == "private" and chat["title"] == "Bob" for chat in chats)
+        )
+        await self.disconnect(history_writer)
+
+    async def test_history_is_limited_to_last_fifty_messages(self) -> None:
+        reader, writer = await self.authenticate("register", "Alice", "alice")
+        await read_packet(reader)
+
+        def save_messages() -> None:
+            for index in range(55):
+                chat_server.DATABASE.save_message(
+                    "general",
+                    "alice",
+                    f"message-{index}",
+                    f"2026-01-01T00:{index:02d}:00+00:00",
+                )
+
+        await asyncio.to_thread(save_messages)
+
+        await write_packet(
+            writer,
+            {
+                "type": "get_history",
+                "request_id": "history-limit",
+                "chat_type": "general",
+                "target": "general",
+            },
+        )
+        messages = (await read_packet(reader))["messages"]
+        self.assertEqual(len(messages), 50)
+        self.assertEqual(messages[0]["text"], "message-5")
+        self.assertEqual(messages[-1]["text"], "message-54")
+        await self.disconnect(writer)
+
     async def test_duplicate_username_is_rejected_before_password(self) -> None:
         alice_reader, alice_writer = await self.authenticate(
             "register", "Alice", "alice"

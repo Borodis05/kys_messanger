@@ -159,6 +159,20 @@ def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
                 print(f"Вы вступили в канал #{packet.get('channel')}.")
         elif action == "leave_channel":
             print(f"Вы вышли из канала #{packet.get('channel')}.")
+        elif action == "get_history":
+            title = packet.get("title", "Чат")
+            messages = packet.get("messages", [])
+            print(f"\n── История: {title} ──")
+            if not messages:
+                print("Сообщений пока нет.")
+            for message in messages:
+                timestamp = str(message.get("sent_at", ""))
+                short_time = timestamp[11:16] if len(timestamp) >= 16 else timestamp
+                print(
+                    f"[{short_time}] {message.get('sender', '?')}: "
+                    f"{message.get('text', '')}"
+                )
+            print("── Новые сообщения ──")
 
 
 def print_help() -> None:
@@ -169,6 +183,7 @@ def print_help() -> None:
     print("Команды внутри открытого чата:")
     print("  обычный текст              отправить сообщение в текущий чат")
     print("  /leave                     выйти из текущего канала")
+    print("  /history                   повторно загрузить историю")
     print("  /back                      вернуться к списку чатов")
     print("Общие команды: /help, /exit")
 
@@ -213,19 +228,38 @@ def build_outgoing_packet(message: str) -> Dict[str, Any]:
 
 
 async def receive_packets(
-    reader: asyncio.StreamReader, interface: ChatInterface
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    interface: ChatInterface,
 ) -> None:
     while True:
         packet = await read_packet(reader)
         if packet is None:
             return
+        action = packet.get("action") if packet.get("type") == "response" else None
         display_packet(packet, interface)
+        if action in {"create_channel", "join_channel"} and interface.current:
+            await request_history(writer, interface.current)
 
 
 async def request_chat_list(writer: asyncio.StreamWriter) -> None:
     await write_packet(
         writer,
         {"type": "list_chats", "request_id": new_request_id()},
+    )
+
+
+async def request_history(
+    writer: asyncio.StreamWriter, target: ChatTarget
+) -> None:
+    await write_packet(
+        writer,
+        {
+            "type": "get_history",
+            "request_id": new_request_id(),
+            "chat_type": target.chat_type,
+            "target": target.identifier,
+        },
     )
 
 
@@ -254,6 +288,13 @@ async def send_messages(
             await request_chat_list(writer)
             continue
 
+        if message.casefold() == "/history":
+            if interface.current is None:
+                print("Сначала откройте чат командой /open N.")
+            else:
+                await request_history(writer, interface.current)
+            continue
+
         if message.casefold().startswith("/open "):
             try:
                 number = int(message.split(maxsplit=1)[1])
@@ -277,6 +318,7 @@ async def send_messages(
             else:
                 interface.current = target
                 print(f"Открыт чат «{target.title}». /back — к списку чатов.")
+                await request_history(writer, target)
             continue
 
         if message.casefold().startswith("/create "):
@@ -454,7 +496,7 @@ async def run_client(host: str, port: int, action: str) -> None:
         ).start()
 
         await request_chat_list(writer)
-        receiver = asyncio.create_task(receive_packets(reader, interface))
+        receiver = asyncio.create_task(receive_packets(reader, writer, interface))
         sender = asyncio.create_task(send_messages(writer, messages, interface))
         done, pending = await asyncio.wait(
             {receiver, sender}, return_when=asyncio.FIRST_COMPLETED

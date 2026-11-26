@@ -29,6 +29,20 @@ class ChannelSummary:
     member_count: int
 
 
+@dataclass(frozen=True)
+class Message:
+    id: int
+    kind: str
+    sender_username: str
+    sender_display_name: str
+    recipient_username: Optional[str]
+    recipient_display_name: Optional[str]
+    channel_name: Optional[str]
+    channel_display_name: Optional[str]
+    text: str
+    created_at: str
+
+
 class Database:
     def __init__(self, path: str) -> None:
         self.path = Path(path)
@@ -36,6 +50,7 @@ class Database:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -69,6 +84,31 @@ class Database:
                     PRIMARY KEY (channel_id, username)
                 )
                 """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (kind IN ('general', 'private', 'channel')),
+                    sender_username TEXT NOT NULL REFERENCES users(username),
+                    recipient_username TEXT REFERENCES users(username),
+                    channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_kind_id "
+                "ON messages(kind, id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_private "
+                "ON messages(sender_username, recipient_username, id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_channel "
+                "ON messages(channel_id, id)"
             )
             connection.commit()
 
@@ -242,6 +282,144 @@ class Database:
                 (name,),
             ).fetchall()
         return [row["username"] for row in rows]
+
+    def save_message(
+        self,
+        kind: str,
+        sender_username: str,
+        text: str,
+        created_at: str,
+        recipient_username: Optional[str] = None,
+        channel_name: Optional[str] = None,
+    ) -> int:
+        with closing(self._connect()) as connection:
+            channel_id = None
+            if channel_name is not None:
+                channel = connection.execute(
+                    "SELECT id FROM channels WHERE name = ?", (channel_name,)
+                ).fetchone()
+                if channel is None:
+                    raise ValueError("Channel does not exist")
+                channel_id = channel["id"]
+
+            cursor = connection.execute(
+                """
+                INSERT INTO messages (
+                    kind,
+                    sender_username,
+                    recipient_username,
+                    channel_id,
+                    text,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    kind,
+                    sender_username,
+                    recipient_username,
+                    channel_id,
+                    text,
+                    created_at,
+                ),
+            )
+            connection.commit()
+            return cursor.lastrowid
+
+    def get_general_history(self, limit: int) -> List[Message]:
+        return self._get_history("m.kind = 'general'", (), limit)
+
+    def get_private_history(
+        self, first_username: str, second_username: str, limit: int
+    ) -> List[Message]:
+        return self._get_history(
+            """
+            m.kind = 'private'
+            AND (
+                (m.sender_username = ? AND m.recipient_username = ?)
+                OR
+                (m.sender_username = ? AND m.recipient_username = ?)
+            )
+            """,
+            (first_username, second_username, second_username, first_username),
+            limit,
+        )
+
+    def get_channel_history(self, channel_name: str, limit: int) -> List[Message]:
+        return self._get_history(
+            "m.kind = 'channel' AND c.name = ?", (channel_name,), limit
+        )
+
+    def list_private_contacts(self, username: str) -> List[User]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT
+                    u.id,
+                    u.username,
+                    u.display_name,
+                    u.password_hash
+                FROM users u
+                JOIN messages m ON u.username = CASE
+                    WHEN m.sender_username = ? THEN m.recipient_username
+                    ELSE m.sender_username
+                END
+                WHERE m.kind = 'private'
+                  AND (m.sender_username = ? OR m.recipient_username = ?)
+                ORDER BY u.display_name COLLATE NOCASE
+                """,
+                (username, username, username),
+            ).fetchall()
+
+        return [
+            User(row["id"], row["username"], row["display_name"], row["password_hash"])
+            for row in rows
+        ]
+
+    def _get_history(
+        self, where_clause: str, parameters: tuple, limit: int
+    ) -> List[Message]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    m.id,
+                    m.kind,
+                    m.sender_username,
+                    sender.display_name AS sender_display_name,
+                    m.recipient_username,
+                    recipient.display_name AS recipient_display_name,
+                    c.name AS channel_name,
+                    c.display_name AS channel_display_name,
+                    m.text,
+                    m.created_at
+                FROM messages m
+                JOIN users sender ON sender.username = m.sender_username
+                LEFT JOIN users recipient
+                    ON recipient.username = m.recipient_username
+                LEFT JOIN channels c ON c.id = m.channel_id
+                WHERE {where_clause}
+                ORDER BY m.id DESC
+                LIMIT ?
+                """,
+                (*parameters, limit),
+            ).fetchall()
+
+        return [
+            Message(
+                row["id"],
+                row["kind"],
+                row["sender_username"],
+                row["sender_display_name"],
+                row["recipient_username"],
+                row["recipient_display_name"],
+                row["channel_name"],
+                row["channel_display_name"],
+                row["text"],
+                row["created_at"],
+            )
+            for row in reversed(rows)
+        ]
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
