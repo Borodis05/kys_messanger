@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import getpass
 import threading
 from typing import Any, Dict
 
@@ -10,6 +11,22 @@ from shared.protocol import (
     read_packet,
     write_packet,
 )
+
+
+def prompt_password(action: str) -> str:
+    while True:
+        password = getpass.getpass("Пароль: ")
+        if action != "register":
+            return password
+
+        confirmation = getpass.getpass("Повторите пароль: ")
+        if password == confirmation:
+            return password
+        print("Пароли не совпадают. Попробуйте ещё раз.")
+
+
+def prompt_username() -> str:
+    return input("Имя пользователя: ").strip()
 
 
 def read_console(
@@ -71,31 +88,90 @@ async def send_messages(
         )
 
 
-async def join_chat(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, nickname: str
-) -> None:
-    request_id = new_request_id()
-    await write_packet(
-        writer,
-        {"type": "join", "request_id": request_id, "name": nickname},
-    )
-    response = await read_packet(reader)
-    if response is None:
-        raise ProtocolError("connection_closed", "Сервер закрыл соединение при входе.")
-    if response.get("type") == "error":
-        raise ProtocolError(
-            str(response.get("code", "join_failed")),
-            str(response.get("message", "Не удалось войти в чат.")),
+async def authenticate(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    action: str,
+) -> str:
+    while True:
+        username = await asyncio.to_thread(prompt_username)
+        username_request_id = new_request_id()
+        await write_packet(
+            writer,
+            {
+                "type": "auth_username",
+                "action": action,
+                "request_id": username_request_id,
+                "username": username,
+            },
         )
-    if (
-        response.get("type") != "response"
-        or response.get("ok") is not True
-        or response.get("request_id") != request_id
-    ):
-        raise ProtocolError("invalid_response", "Сервер прислал некорректный ответ.")
+        username_response = await read_packet(reader)
+        if username_response is None:
+            raise ProtocolError(
+                "connection_closed", "Сервер закрыл соединение при аутентификации."
+            )
+        if username_response.get("type") == "error":
+            print(
+                f"Ошибка имени [{username_response.get('code', 'auth_failed')}]: "
+                f"{username_response.get('message', '')}"
+            )
+            continue
+        if (
+            username_response.get("type") != "response"
+            or username_response.get("ok") is not True
+            or username_response.get("request_id") != username_request_id
+            or username_response.get("action") != "auth_username"
+        ):
+            raise ProtocolError(
+                "invalid_response", "Сервер прислал некорректный ответ."
+            )
+
+        authenticated_name = username_response.get("username")
+        if not isinstance(authenticated_name, str):
+            raise ProtocolError(
+                "invalid_response", "В ответе сервера отсутствует username."
+            )
+        print(f"Имя {authenticated_name} принято.")
+
+        while True:
+            password = await asyncio.to_thread(prompt_password, action)
+            password_request_id = new_request_id()
+            await write_packet(
+                writer,
+                {
+                    "type": "auth_password",
+                    "request_id": password_request_id,
+                    "password": password,
+                },
+            )
+            password_response = await read_packet(reader)
+            if password_response is None:
+                raise ProtocolError(
+                    "connection_closed",
+                    "Сервер закрыл соединение при аутентификации.",
+                )
+            if password_response.get("type") == "error":
+                error_code = str(password_response.get("code", "auth_failed"))
+                print(
+                    f"Ошибка пароля [{error_code}]: "
+                    f"{password_response.get('message', '')}"
+                )
+                if error_code in {"user_exists", "expected_username"}:
+                    break
+                continue
+            if (
+                password_response.get("type") != "response"
+                or password_response.get("ok") is not True
+                or password_response.get("request_id") != password_request_id
+                or password_response.get("action") != action
+            ):
+                raise ProtocolError(
+                    "invalid_response", "Сервер прислал некорректный ответ."
+                )
+            return authenticated_name
 
 
-async def run_client(host: str, port: int, nickname: str) -> None:
+async def run_client(host: str, port: int, action: str) -> None:
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port, limit=MAX_PACKET_SIZE + 1),
@@ -109,8 +185,8 @@ async def run_client(host: str, port: int, nickname: str) -> None:
         return
 
     try:
-        await join_chat(reader, writer, nickname)
-        print(f"Вы подключены к {host}:{port} как {nickname}.")
+        authenticated_name = await authenticate(reader, writer, action)
+        print(f"Вы подключены к {host}:{port} как {authenticated_name}.")
         print("Введите сообщение или /exit для выхода.")
 
         messages: asyncio.Queue[str] = asyncio.Queue()
@@ -150,10 +226,17 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Консольный TCP-клиент чата")
     parser.add_argument("--host", default="127.0.0.1", help="Адрес сервера")
     parser.add_argument("--port", type=int, default=8888, help="TCP-порт сервера")
-    parser.add_argument("--name", required=True, help="Имя пользователя в чате")
+    commands = parser.add_subparsers(dest="action", required=True)
+
+    register_parser = commands.add_parser("register", help="Создать учётную запись")
+
+    login_parser = commands.add_parser("login", help="Войти в существующую запись")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = parse_arguments()
-    asyncio.run(run_client(arguments.host, arguments.port, arguments.name))
+    try:
+        asyncio.run(run_client(arguments.host, arguments.port, arguments.action))
+    except KeyboardInterrupt:
+        print("\nКлиент остановлен.")

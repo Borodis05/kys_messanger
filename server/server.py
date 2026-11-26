@@ -1,15 +1,30 @@
 import argparse
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
+from server.auth import (
+    CredentialsError,
+    DUMMY_PASSWORD_HASH,
+    hash_password,
+    validate_password,
+    validate_username,
+    verify_password,
+)
+from server.database import Database, User
 from shared.protocol import MAX_PACKET_SIZE, ProtocolError, read_packet, write_packet
 
 
-MAX_NAME_LENGTH = 32
 MAX_MESSAGE_LENGTH = 2000
 MAX_REQUEST_ID_LENGTH = 64
 CLIENTS: Dict[str, asyncio.StreamWriter] = {}
+DATABASE = Database("data/chat.db")
+
+
+def configure_database(path: str) -> None:
+    global DATABASE
+    DATABASE = Database(path)
+    DATABASE.initialize()
 
 
 def utc_timestamp() -> str:
@@ -47,67 +62,174 @@ async def send_error(
 
 
 async def send_success(
-    writer: asyncio.StreamWriter, request_id: str, action: str
+    writer: asyncio.StreamWriter,
+    request_id: str,
+    action: str,
+    **fields: Any,
 ) -> None:
-    await write_packet(
-        writer,
-        {
-            "type": "response",
-            "ok": True,
-            "action": action,
-            "request_id": request_id,
-        },
-    )
+    packet = {
+        "type": "response",
+        "ok": True,
+        "action": action,
+        "request_id": request_id,
+    }
+    packet.update(fields)
+    await write_packet(writer, packet)
 
 
 async def broadcast(packet: Dict[str, Any]) -> None:
     disconnected = []
-    for name, writer in list(CLIENTS.items()):
+    for username, writer in list(CLIENTS.items()):
         try:
             await write_packet(writer, packet)
         except (ConnectionError, OSError):
-            disconnected.append(name)
+            disconnected.append(username)
 
-    for name in disconnected:
-        CLIENTS.pop(name, None)
+    for username in disconnected:
+        CLIENTS.pop(username, None)
 
 
-async def read_join_request(reader: asyncio.StreamReader) -> tuple[str, str]:
-    packet = await asyncio.wait_for(read_packet(reader), timeout=30)
-    if packet is None:
-        raise ProtocolError("connection_closed", "Соединение закрыто до входа.")
+def parse_username(packet: Dict[str, Any], request_id: str) -> Tuple[str, str]:
+    try:
+        username, display_name = validate_username(packet.get("username"))
+    except CredentialsError as error:
+        raise ProtocolError("invalid_username", str(error), request_id) from error
+    return username, display_name
 
-    request_id = require_request_id(packet)
-    if packet.get("type") != "join":
+
+def parse_password(packet: Dict[str, Any], request_id: str) -> str:
+    try:
+        password = validate_password(packet.get("password"))
+    except CredentialsError as error:
+        raise ProtocolError("invalid_password", str(error), request_id) from error
+    return password
+
+
+async def register_user(
+    username: str, display_name: str, password: str, request_id: str
+) -> User:
+    password_hash = await asyncio.to_thread(hash_password, password)
+    user = await asyncio.to_thread(
+        DATABASE.create_user, username, display_name, password_hash
+    )
+    if user is None:
         raise ProtocolError(
-            "expected_join", "Первый пакет должен иметь тип join.", request_id
+            "user_exists", "Пользователь с таким именем уже зарегистрирован.", request_id
         )
+    return user
 
-    nickname = packet.get("name")
-    if not isinstance(nickname, str):
-        raise ProtocolError(
-            "invalid_name", "Поле name должно быть строкой.", request_id
-        )
 
-    nickname = nickname.strip()
-    if not nickname or len(nickname) > MAX_NAME_LENGTH:
+async def login_user(username: str, password: str, request_id: str) -> User:
+    user = await asyncio.to_thread(DATABASE.get_user, username)
+    stored_hash = user.password_hash if user is not None else DUMMY_PASSWORD_HASH
+    password_is_valid = await asyncio.to_thread(
+        verify_password, password, stored_hash
+    )
+    if user is None or not password_is_valid:
         raise ProtocolError(
-            "invalid_name",
-            "Имя должно содержать от 1 до 32 символов.",
-            request_id,
+            "invalid_credentials", "Неверное имя пользователя или пароль.", request_id
         )
-    if nickname in CLIENTS:
-        raise ProtocolError(
-            "name_taken",
-            "Пользователь с таким именем уже подключён.",
-            request_id,
-        )
+    return user
 
-    return nickname, request_id
+
+async def authenticate_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> Tuple[str, str, str, str]:
+    pending_action: Optional[str] = None
+    pending_username: Optional[str] = None
+    pending_display_name: Optional[str] = None
+
+    while True:
+        try:
+            packet = await asyncio.wait_for(read_packet(reader), timeout=300)
+            if packet is None:
+                raise ProtocolError(
+                    "connection_closed", "Соединение закрыто до аутентификации."
+                )
+
+            request_id = require_request_id(packet)
+            packet_type = packet.get("type")
+
+            if packet_type == "auth_username":
+                action = packet.get("action")
+                if action not in {"register", "login"}:
+                    raise ProtocolError(
+                        "invalid_auth_action",
+                        "Поле action должно иметь значение register или login.",
+                        request_id,
+                    )
+
+                username, entered_name = parse_username(packet, request_id)
+                existing_user = await asyncio.to_thread(DATABASE.get_user, username)
+                if action == "register" and existing_user is not None:
+                    raise ProtocolError(
+                        "user_exists",
+                        "Пользователь с таким именем уже зарегистрирован.",
+                        request_id,
+                    )
+                if action == "login" and existing_user is None:
+                    raise ProtocolError(
+                        "username_not_found",
+                        "Пользователь с таким именем не найден.",
+                        request_id,
+                    )
+                if username in CLIENTS:
+                    raise ProtocolError(
+                        "already_online",
+                        "Эта учётная запись уже используется в чате.",
+                        request_id,
+                    )
+
+                pending_action = action
+                pending_username = username
+                pending_display_name = (
+                    existing_user.display_name
+                    if existing_user is not None
+                    else entered_name
+                )
+                await send_success(
+                    writer,
+                    request_id,
+                    "auth_username",
+                    auth_action=action,
+                    username=pending_display_name,
+                )
+                continue
+
+            if packet_type != "auth_password" or pending_action is None:
+                raise ProtocolError(
+                    "expected_username",
+                    "Сначала отправьте пакет auth_username.",
+                    request_id,
+                )
+
+            password = parse_password(packet, request_id)
+            if pending_action == "register":
+                try:
+                    user = await register_user(
+                        pending_username,
+                        pending_display_name,
+                        password,
+                        request_id,
+                    )
+                except ProtocolError as error:
+                    if error.code == "user_exists":
+                        pending_action = None
+                        pending_username = None
+                        pending_display_name = None
+                    raise
+            else:
+                user = await login_user(pending_username, password, request_id)
+
+            return user.username, user.display_name, request_id, pending_action
+        except ProtocolError as error:
+            if error.code == "connection_closed":
+                raise
+            await send_error(writer, error, error.request_id)
 
 
 async def process_client_packet(
-    packet: Dict[str, Any], nickname: str, writer: asyncio.StreamWriter
+    packet: Dict[str, Any], display_name: str, writer: asyncio.StreamWriter
 ) -> None:
     request_id = require_request_id(packet)
     packet_type = packet.get("type")
@@ -128,11 +250,11 @@ async def process_client_packet(
         )
 
     await send_success(writer, request_id, "chat_message")
-    print(f"[{nickname}] {message}")
+    print(f"[{display_name}] {message}")
     await broadcast(
         {
             "type": "message",
-            "sender": nickname,
+            "sender": display_name,
             "text": message,
             "sent_at": utc_timestamp(),
         }
@@ -143,24 +265,31 @@ async def handle_client(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
     address = writer.get_extra_info("peername")
-    nickname: Optional[str] = None
+    username: Optional[str] = None
+    display_name: Optional[str] = None
     print(f"[+] Новое подключение: {address}")
 
     try:
         try:
-            nickname, join_request_id = await read_join_request(reader)
-        except ProtocolError as error:
-            await send_error(writer, error, error.request_id)
+            username, display_name, auth_request_id, auth_action = (
+                await authenticate_client(reader, writer)
+            )
+        except ProtocolError:
             return
 
-        CLIENTS[nickname] = writer
-        await send_success(writer, join_request_id, "join")
-        print(f"[+] Пользователь вошёл: {nickname} ({address})")
+        CLIENTS[username] = writer
+        await send_success(
+            writer,
+            auth_request_id,
+            auth_action,
+            username=display_name,
+        )
+        print(f"[+] Пользователь вошёл: {display_name} ({address})")
         await broadcast(
             {
                 "type": "system",
                 "event": "user_joined",
-                "text": f"{nickname} присоединился к чату.",
+                "text": f"{display_name} присоединился к чату.",
                 "sent_at": utc_timestamp(),
             }
         )
@@ -172,7 +301,7 @@ async def handle_client(
                 if packet is None:
                     break
                 request_id = packet.get("request_id")
-                await process_client_packet(packet, nickname, writer)
+                await process_client_packet(packet, display_name, writer)
             except ProtocolError as error:
                 valid_request_id = (
                     request_id
@@ -184,19 +313,21 @@ async def handle_client(
     except asyncio.TimeoutError:
         await send_error(
             writer,
-            ProtocolError("join_timeout", "Время ожидания входа истекло."),
+            ProtocolError(
+                "auth_timeout", "Время ожидания аутентификации истекло."
+            ),
         )
     except (ConnectionError, OSError) as error:
         print(f"[!] Ошибка соединения с {address}: {error}")
     finally:
-        if nickname and CLIENTS.get(nickname) is writer:
-            CLIENTS.pop(nickname, None)
-            print(f"[-] Пользователь вышел: {nickname}")
+        if username and CLIENTS.get(username) is writer:
+            CLIENTS.pop(username, None)
+            print(f"[-] Пользователь вышел: {display_name}")
             await broadcast(
                 {
                     "type": "system",
                     "event": "user_left",
-                    "text": f"{nickname} покинул чат.",
+                    "text": f"{display_name} покинул чат.",
                     "sent_at": utc_timestamp(),
                 }
             )
@@ -209,11 +340,13 @@ async def handle_client(
 
 
 async def run_server(host: str, port: int) -> None:
+    await asyncio.to_thread(DATABASE.initialize)
     server = await asyncio.start_server(
         handle_client, host, port, limit=MAX_PACKET_SIZE + 1
     )
     addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     print(f"Сервер запущен: {addresses}")
+    print(f"База данных: {DATABASE.path}")
     print("Ожидание клиентов. Для остановки нажмите Ctrl+C.")
 
     async with server:
@@ -224,11 +357,15 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Асинхронный TCP-сервер чата")
     parser.add_argument("--host", default="127.0.0.1", help="Адрес для прослушивания")
     parser.add_argument("--port", type=int, default=8888, help="TCP-порт")
+    parser.add_argument(
+        "--database", default="data/chat.db", help="Путь к базе данных SQLite"
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = parse_arguments()
+    DATABASE = Database(arguments.database)
     try:
         asyncio.run(run_server(arguments.host, arguments.port))
     except KeyboardInterrupt:
