@@ -51,6 +51,16 @@ def display_packet(packet: Dict[str, Any]) -> None:
     packet_type = packet.get("type")
     if packet_type == "message":
         print(f"[{packet.get('sender', '?')}] {packet.get('text', '')}")
+    elif packet_type == "private_message":
+        print(
+            f"[Личное: {packet.get('sender', '?')} → "
+            f"{packet.get('recipient', '?')}] {packet.get('text', '')}"
+        )
+    elif packet_type == "channel_message":
+        print(
+            f"[#{packet.get('channel', '?')}] "
+            f"{packet.get('sender', '?')}: {packet.get('text', '')}"
+        )
     elif packet_type == "system":
         print(f"[Система] {packet.get('text', '')}")
     elif packet_type == "error":
@@ -58,6 +68,79 @@ def display_packet(packet: Dict[str, Any]) -> None:
             f"[Ошибка: {packet.get('code', 'unknown')}] "
             f"{packet.get('message', '')}"
         )
+    elif packet_type == "response":
+        action = packet.get("action")
+        if action == "list_users":
+            users = packet.get("users", [])
+            print("Пользователи онлайн: " + (", ".join(users) or "нет"))
+        elif action == "list_channels":
+            channels = packet.get("channels", [])
+            if not channels:
+                print("Каналы ещё не созданы.")
+            for channel in channels:
+                membership = "участник" if channel.get("is_member") else "не участник"
+                print(
+                    f"#{channel.get('name')} — {membership}, "
+                    f"участников: {channel.get('member_count', 0)}"
+                )
+        elif action == "create_channel":
+            print(f"Канал #{packet.get('channel')} создан.")
+        elif action == "join_channel":
+            print(f"Вы вступили в канал #{packet.get('channel')}.")
+        elif action == "leave_channel":
+            print(f"Вы вышли из канала #{packet.get('channel')}.")
+
+
+def print_help() -> None:
+    print("Команды:")
+    print("  обычный текст              сообщение в общий чат")
+    print("  /users                     пользователи онлайн")
+    print("  /msg USER TEXT             личное сообщение")
+    print("  /channels                  список каналов")
+    print("  /create CHANNEL            создать канал")
+    print("  /join CHANNEL              вступить в канал")
+    print("  /leave CHANNEL             выйти из канала")
+    print("  /channel CHANNEL TEXT      сообщение в канал")
+    print("  /exit                      выйти из чата")
+
+
+def build_outgoing_packet(message: str) -> Dict[str, Any]:
+    request_id = new_request_id()
+    if not message.startswith("/"):
+        return {"type": "chat_message", "request_id": request_id, "text": message}
+
+    command = message.split(maxsplit=2)
+    name = command[0].casefold()
+    if name == "/users" and len(command) == 1:
+        return {"type": "list_users", "request_id": request_id}
+    if name == "/channels" and len(command) == 1:
+        return {"type": "list_channels", "request_id": request_id}
+    if name in {"/create", "/join", "/leave"} and len(command) == 2:
+        packet_types = {
+            "/create": "create_channel",
+            "/join": "join_channel",
+            "/leave": "leave_channel",
+        }
+        return {
+            "type": packet_types[name],
+            "request_id": request_id,
+            "channel": command[1],
+        }
+    if name == "/msg" and len(command) == 3:
+        return {
+            "type": "private_message",
+            "request_id": request_id,
+            "recipient": command[1],
+            "text": command[2],
+        }
+    if name == "/channel" and len(command) == 3:
+        return {
+            "type": "channel_message",
+            "request_id": request_id,
+            "channel": command[1],
+            "text": command[2],
+        }
+    raise ValueError("Неизвестная команда или неверное количество аргументов.")
 
 
 async def receive_packets(reader: asyncio.StreamReader) -> None:
@@ -78,14 +161,16 @@ async def send_messages(
         if not message:
             continue
 
-        await write_packet(
-            writer,
-            {
-                "type": "chat_message",
-                "request_id": new_request_id(),
-                "text": message,
-            },
-        )
+        if message.casefold() == "/help":
+            print_help()
+            continue
+
+        try:
+            packet = build_outgoing_packet(message)
+        except ValueError as error:
+            print(f"Ошибка команды: {error} Используйте /help.")
+            continue
+        await write_packet(writer, packet)
 
 
 async def authenticate(
@@ -187,7 +272,7 @@ async def run_client(host: str, port: int, action: str) -> None:
     try:
         authenticated_name = await authenticate(reader, writer, action)
         print(f"Вы подключены к {host}:{port} как {authenticated_name}.")
-        print("Введите сообщение или /exit для выхода.")
+        print("Введите сообщение или /help для списка команд.")
 
         messages: asyncio.Queue[str] = asyncio.Queue()
         threading.Thread(

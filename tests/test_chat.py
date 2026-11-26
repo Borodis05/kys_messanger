@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from client.client import prompt_password
+from client.client import build_outgoing_packet, prompt_password
 from server import server as chat_server
 from server.auth import verify_password
 from shared.protocol import MAX_PACKET_SIZE, read_packet, write_packet
@@ -128,6 +128,121 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await alice_writer.wait_closed()
         await bob_writer.wait_closed()
 
+    async def test_private_message_is_delivered_only_to_recipient(self) -> None:
+        alice_reader, alice_writer = await self.authenticate(
+            "register", "Alice", "alice"
+        )
+        await read_packet(alice_reader)
+        bob_reader, bob_writer = await self.authenticate("register", "Bob", "bob")
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "private_message",
+                "request_id": "private-1",
+                "recipient": "Bob",
+                "text": "secret",
+            },
+        )
+        acknowledgement = await read_packet(alice_reader)
+        alice_copy = await read_packet(alice_reader)
+        bob_message = await read_packet(bob_reader)
+
+        self.assertEqual(acknowledgement["action"], "private_message")
+        self.assertEqual(alice_copy["text"], "secret")
+        self.assertEqual(bob_message["sender"], "Alice")
+        self.assertEqual(bob_message["recipient"], "Bob")
+
+        alice_writer.close()
+        bob_writer.close()
+        await alice_writer.wait_closed()
+        await bob_writer.wait_closed()
+
+    async def test_channel_membership_controls_delivery(self) -> None:
+        alice_reader, alice_writer = await self.authenticate(
+            "register", "Alice", "alice"
+        )
+        await read_packet(alice_reader)
+        bob_reader, bob_writer = await self.authenticate("register", "Bob", "bob")
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "create_channel",
+                "request_id": "create-1",
+                "channel": "Developers",
+            },
+        )
+        created = await read_packet(alice_reader)
+        self.assertEqual(created["action"], "create_channel")
+
+        await write_packet(
+            bob_writer,
+            {
+                "type": "list_channels",
+                "request_id": "channels-1",
+            },
+        )
+        channels = await read_packet(bob_reader)
+        self.assertEqual(channels["channels"][0]["name"], "Developers")
+        self.assertFalse(channels["channels"][0]["is_member"])
+
+        await write_packet(
+            bob_writer,
+            {
+                "type": "channel_message",
+                "request_id": "channel-denied",
+                "channel": "developers",
+                "text": "not yet",
+            },
+        )
+        denied = await read_packet(bob_reader)
+        self.assertEqual(denied["code"], "not_member")
+
+        await write_packet(
+            bob_writer,
+            {
+                "type": "join_channel",
+                "request_id": "join-1",
+                "channel": "developers",
+            },
+        )
+        joined = await read_packet(bob_reader)
+        self.assertEqual(joined["action"], "join_channel")
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "channel_message",
+                "request_id": "channel-1",
+                "channel": "Developers",
+                "text": "team message",
+            },
+        )
+        self.assertEqual((await read_packet(alice_reader))["action"], "channel_message")
+        self.assertEqual((await read_packet(alice_reader))["text"], "team message")
+        self.assertEqual((await read_packet(bob_reader))["text"], "team message")
+
+        await write_packet(
+            bob_writer,
+            {
+                "type": "leave_channel",
+                "request_id": "leave-1",
+                "channel": "Developers",
+            },
+        )
+        left = await read_packet(bob_reader)
+        self.assertEqual(left["action"], "leave_channel")
+
+        alice_writer.close()
+        bob_writer.close()
+        await alice_writer.wait_closed()
+        await bob_writer.wait_closed()
+
     async def test_duplicate_username_is_rejected_before_password(self) -> None:
         alice_reader, alice_writer = await self.authenticate(
             "register", "Alice", "alice"
@@ -218,6 +333,20 @@ class PasswordPromptTest(unittest.TestCase):
     def test_registration_password_must_be_entered_twice(self, mocked_getpass) -> None:
         self.assertEqual(prompt_password("register"), "final-password")
         self.assertEqual(mocked_getpass.call_count, 4)
+
+
+class CommandParserTest(unittest.TestCase):
+    def test_private_message_command(self) -> None:
+        packet = build_outgoing_packet("/msg Bob hello there")
+        self.assertEqual(packet["type"], "private_message")
+        self.assertEqual(packet["recipient"], "Bob")
+        self.assertEqual(packet["text"], "hello there")
+
+    def test_channel_message_command(self) -> None:
+        packet = build_outgoing_packet("/channel Developers release ready")
+        self.assertEqual(packet["type"], "channel_message")
+        self.assertEqual(packet["channel"], "Developers")
+        self.assertEqual(packet["text"], "release ready")
 
 
 if __name__ == "__main__":

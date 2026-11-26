@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -17,7 +19,16 @@ from shared.protocol import MAX_PACKET_SIZE, ProtocolError, read_packet, write_p
 
 MAX_MESSAGE_LENGTH = 2000
 MAX_REQUEST_ID_LENGTH = 64
-CLIENTS: Dict[str, asyncio.StreamWriter] = {}
+CHANNEL_PATTERN = re.compile(r"^[A-Za-zА-Яа-яЁё0-9_-]{3,32}$")
+
+
+@dataclass
+class ClientSession:
+    display_name: str
+    writer: asyncio.StreamWriter
+
+
+CLIENTS: Dict[str, ClientSession] = {}
 DATABASE = Database("data/chat.db")
 
 
@@ -79,14 +90,53 @@ async def send_success(
 
 async def broadcast(packet: Dict[str, Any]) -> None:
     disconnected = []
-    for username, writer in list(CLIENTS.items()):
+    for username, session in list(CLIENTS.items()):
         try:
-            await write_packet(writer, packet)
+            await write_packet(session.writer, packet)
         except (ConnectionError, OSError):
             disconnected.append(username)
 
     for username in disconnected:
         CLIENTS.pop(username, None)
+
+
+async def send_to_users(usernames: list[str], packet: Dict[str, Any]) -> None:
+    for username in dict.fromkeys(usernames):
+        session = CLIENTS.get(username)
+        if session is None:
+            continue
+        try:
+            await write_packet(session.writer, packet)
+        except (ConnectionError, OSError):
+            CLIENTS.pop(username, None)
+
+
+def require_message(packet: Dict[str, Any]) -> str:
+    message = packet.get("text")
+    if not isinstance(message, str):
+        raise ProtocolError("invalid_message", "Поле text должно быть строкой.")
+
+    message = message.strip()
+    if not message or len(message) > MAX_MESSAGE_LENGTH:
+        raise ProtocolError(
+            "invalid_message",
+            f"Сообщение должно содержать от 1 до {MAX_MESSAGE_LENGTH} символов.",
+        )
+    return message
+
+
+def require_channel_name(packet: Dict[str, Any]) -> Tuple[str, str]:
+    channel = packet.get("channel")
+    if not isinstance(channel, str):
+        raise ProtocolError("invalid_channel", "Поле channel должно быть строкой.")
+
+    display_name = channel.strip()
+    if not CHANNEL_PATTERN.fullmatch(display_name):
+        raise ProtocolError(
+            "invalid_channel",
+            "Название канала должно содержать 3–32 буквы, цифры, _ или -.",
+        )
+    return display_name.casefold(), display_name
 
 
 def parse_username(packet: Dict[str, Any], request_id: str) -> Tuple[str, str]:
@@ -229,36 +279,154 @@ async def authenticate_client(
 
 
 async def process_client_packet(
-    packet: Dict[str, Any], display_name: str, writer: asyncio.StreamWriter
+    packet: Dict[str, Any],
+    username: str,
+    display_name: str,
+    writer: asyncio.StreamWriter,
 ) -> None:
     request_id = require_request_id(packet)
     packet_type = packet.get("type")
-    if packet_type != "chat_message":
-        raise ProtocolError(
-            "unknown_type", f"Неизвестный тип пакета: {packet_type!r}."
+
+    if packet_type == "chat_message":
+        message = require_message(packet)
+        await send_success(writer, request_id, "chat_message")
+        print(f"[{display_name}] {message}")
+        await broadcast(
+            {
+                "type": "message",
+                "sender": display_name,
+                "text": message,
+                "sent_at": utc_timestamp(),
+            }
         )
+        return
 
-    message = packet.get("text")
-    if not isinstance(message, str):
-        raise ProtocolError("invalid_message", "Поле text должно быть строкой.")
-
-    message = message.strip()
-    if not message or len(message) > MAX_MESSAGE_LENGTH:
-        raise ProtocolError(
-            "invalid_message",
-            f"Сообщение должно содержать от 1 до {MAX_MESSAGE_LENGTH} символов.",
+    if packet_type == "list_users":
+        users = sorted(
+            (session.display_name for session in CLIENTS.values()),
+            key=str.casefold,
         )
+        await send_success(writer, request_id, "list_users", users=users)
+        return
 
-    await send_success(writer, request_id, "chat_message")
-    print(f"[{display_name}] {message}")
-    await broadcast(
-        {
-            "type": "message",
+    if packet_type == "private_message":
+        message = require_message(packet)
+        try:
+            recipient, _ = validate_username(packet.get("recipient"))
+        except CredentialsError as error:
+            raise ProtocolError("invalid_recipient", str(error)) from error
+
+        recipient_user = await asyncio.to_thread(DATABASE.get_user, recipient)
+        if recipient_user is None:
+            raise ProtocolError("user_not_found", "Получатель не найден.")
+        if recipient not in CLIENTS:
+            raise ProtocolError("user_offline", "Получатель сейчас не в сети.")
+
+        await send_success(writer, request_id, "private_message")
+        private_packet = {
+            "type": "private_message",
             "sender": display_name,
+            "recipient": recipient_user.display_name,
             "text": message,
             "sent_at": utc_timestamp(),
         }
-    )
+        await send_to_users([username, recipient], private_packet)
+        return
+
+    if packet_type == "list_channels":
+        channels = await asyncio.to_thread(DATABASE.list_channels, username)
+        await send_success(
+            writer,
+            request_id,
+            "list_channels",
+            channels=[
+                {
+                    "name": channel.display_name,
+                    "is_member": channel.is_member,
+                    "member_count": channel.member_count,
+                }
+                for channel in channels
+            ],
+        )
+        return
+
+    if packet_type == "create_channel":
+        channel_name, channel_display_name = require_channel_name(packet)
+        channel = await asyncio.to_thread(
+            DATABASE.create_channel,
+            channel_name,
+            channel_display_name,
+            username,
+        )
+        if channel is None:
+            raise ProtocolError("channel_exists", "Канал с таким именем уже существует.")
+        await send_success(
+            writer,
+            request_id,
+            "create_channel",
+            channel=channel.display_name,
+        )
+        return
+
+    if packet_type in {"join_channel", "leave_channel"}:
+        channel_name, channel_display_name = require_channel_name(packet)
+        if packet_type == "join_channel":
+            result = await asyncio.to_thread(
+                DATABASE.join_channel, channel_name, username
+            )
+            if result == "not_found":
+                raise ProtocolError("channel_not_found", "Канал не найден.")
+            if result == "already_member":
+                raise ProtocolError("already_member", "Вы уже состоите в канале.")
+            action = "join_channel"
+        else:
+            result = await asyncio.to_thread(
+                DATABASE.leave_channel, channel_name, username
+            )
+            if result == "not_found":
+                raise ProtocolError("channel_not_found", "Канал не найден.")
+            if result == "not_member":
+                raise ProtocolError("not_member", "Вы не состоите в канале.")
+            action = "leave_channel"
+
+        channel = await asyncio.to_thread(DATABASE.get_channel, channel_name)
+        await send_success(
+            writer,
+            request_id,
+            action,
+            channel=channel.display_name if channel else channel_display_name,
+        )
+        return
+
+    if packet_type == "channel_message":
+        channel_name, channel_display_name = require_channel_name(packet)
+        message = require_message(packet)
+        channel = await asyncio.to_thread(DATABASE.get_channel, channel_name)
+        if channel is None:
+            raise ProtocolError("channel_not_found", "Канал не найден.")
+        is_member = await asyncio.to_thread(
+            DATABASE.is_channel_member, channel_name, username
+        )
+        if not is_member:
+            raise ProtocolError("not_member", "Вы не состоите в этом канале.")
+
+        member_usernames = await asyncio.to_thread(
+            DATABASE.list_channel_members, channel_name
+        )
+        await send_success(writer, request_id, "channel_message")
+        await send_to_users(
+            member_usernames,
+            {
+                "type": "channel_message",
+                "channel": channel.display_name or channel_display_name,
+                "sender": display_name,
+                "text": message,
+                "sent_at": utc_timestamp(),
+            },
+        )
+        return
+
+    raise ProtocolError("unknown_type", f"Неизвестный тип пакета: {packet_type!r}.")
 
 
 async def handle_client(
@@ -277,7 +445,7 @@ async def handle_client(
         except ProtocolError:
             return
 
-        CLIENTS[username] = writer
+        CLIENTS[username] = ClientSession(display_name, writer)
         await send_success(
             writer,
             auth_request_id,
@@ -301,7 +469,9 @@ async def handle_client(
                 if packet is None:
                     break
                 request_id = packet.get("request_id")
-                await process_client_packet(packet, display_name, writer)
+                await process_client_packet(
+                    packet, username, display_name, writer
+                )
             except ProtocolError as error:
                 valid_request_id = (
                     request_id
@@ -320,17 +490,19 @@ async def handle_client(
     except (ConnectionError, OSError) as error:
         print(f"[!] Ошибка соединения с {address}: {error}")
     finally:
-        if username and CLIENTS.get(username) is writer:
-            CLIENTS.pop(username, None)
-            print(f"[-] Пользователь вышел: {display_name}")
-            await broadcast(
-                {
-                    "type": "system",
-                    "event": "user_left",
-                    "text": f"{display_name} покинул чат.",
-                    "sent_at": utc_timestamp(),
-                }
-            )
+        if username:
+            session = CLIENTS.get(username)
+            if session is not None and session.writer is writer:
+                CLIENTS.pop(username, None)
+                print(f"[-] Пользователь вышел: {display_name}")
+                await broadcast(
+                    {
+                        "type": "system",
+                        "event": "user_left",
+                        "text": f"{display_name} покинул чат.",
+                        "sent_at": utc_timestamp(),
+                    }
+                )
 
         writer.close()
         try:
