@@ -1,12 +1,20 @@
 import argparse
 import asyncio
 import threading
+from typing import Any, Dict
+
+from shared.protocol import (
+    MAX_PACKET_SIZE,
+    ProtocolError,
+    new_request_id,
+    read_packet,
+    write_packet,
+)
 
 
 def read_console(
     loop: asyncio.AbstractEventLoop, messages: asyncio.Queue[str]
 ) -> None:
-    """Read blocking console input without blocking the network event loop."""
     while True:
         try:
             message = input("> ").strip()
@@ -22,9 +30,25 @@ def read_console(
             return
 
 
-async def receive_messages(reader: asyncio.StreamReader) -> None:
-    while raw_message := await reader.readline():
-        print(raw_message.decode("utf-8").rstrip("\r\n"))
+def display_packet(packet: Dict[str, Any]) -> None:
+    packet_type = packet.get("type")
+    if packet_type == "message":
+        print(f"[{packet.get('sender', '?')}] {packet.get('text', '')}")
+    elif packet_type == "system":
+        print(f"[Система] {packet.get('text', '')}")
+    elif packet_type == "error":
+        print(
+            f"[Ошибка: {packet.get('code', 'unknown')}] "
+            f"{packet.get('message', '')}"
+        )
+
+
+async def receive_packets(reader: asyncio.StreamReader) -> None:
+    while True:
+        packet = await read_packet(reader)
+        if packet is None:
+            return
+        display_packet(packet)
 
 
 async def send_messages(
@@ -37,14 +61,45 @@ async def send_messages(
         if not message:
             continue
 
-        writer.write(f"{message}\n".encode("utf-8"))
-        await writer.drain()
+        await write_packet(
+            writer,
+            {
+                "type": "chat_message",
+                "request_id": new_request_id(),
+                "text": message,
+            },
+        )
+
+
+async def join_chat(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, nickname: str
+) -> None:
+    request_id = new_request_id()
+    await write_packet(
+        writer,
+        {"type": "join", "request_id": request_id, "name": nickname},
+    )
+    response = await read_packet(reader)
+    if response is None:
+        raise ProtocolError("connection_closed", "Сервер закрыл соединение при входе.")
+    if response.get("type") == "error":
+        raise ProtocolError(
+            str(response.get("code", "join_failed")),
+            str(response.get("message", "Не удалось войти в чат.")),
+        )
+    if (
+        response.get("type") != "response"
+        or response.get("ok") is not True
+        or response.get("request_id") != request_id
+    ):
+        raise ProtocolError("invalid_response", "Сервер прислал некорректный ответ.")
 
 
 async def run_client(host: str, port: int, nickname: str) -> None:
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10
+            asyncio.open_connection(host, port, limit=MAX_PACKET_SIZE + 1),
+            timeout=10,
         )
     except ConnectionRefusedError:
         print(f"Не удалось подключиться: сервер {host}:{port} не запущен.")
@@ -54,27 +109,18 @@ async def run_client(host: str, port: int, nickname: str) -> None:
         return
 
     try:
-        writer.write(f"{nickname}\n".encode("utf-8"))
-        await writer.drain()
-
-        raw_response = await reader.readline()
-        response = raw_response.decode("utf-8").rstrip("\r\n")
-        if response != "OK":
-            print(response or "Сервер закрыл соединение при входе.")
-            return
-
+        await join_chat(reader, writer, nickname)
         print(f"Вы подключены к {host}:{port} как {nickname}.")
         print("Введите сообщение или /exit для выхода.")
 
         messages: asyncio.Queue[str] = asyncio.Queue()
-        console_thread = threading.Thread(
+        threading.Thread(
             target=read_console,
             args=(asyncio.get_running_loop(), messages),
             daemon=True,
-        )
-        console_thread.start()
+        ).start()
 
-        receiver = asyncio.create_task(receive_messages(reader))
+        receiver = asyncio.create_task(receive_packets(reader))
         sender = asyncio.create_task(send_messages(writer, messages))
         done, pending = await asyncio.wait(
             {receiver, sender}, return_when=asyncio.FIRST_COMPLETED
@@ -87,7 +133,9 @@ async def run_client(host: str, port: int, nickname: str) -> None:
         for task in done:
             if task.exception():
                 raise task.exception()
-    except (ConnectionError, UnicodeError, OSError) as error:
+    except ProtocolError as error:
+        print(f"Ошибка протокола [{error.code}]: {error.message}")
+    except (ConnectionError, OSError) as error:
         print(f"Ошибка соединения: {error}")
     finally:
         writer.close()
