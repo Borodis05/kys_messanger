@@ -2,7 +2,8 @@ import argparse
 import asyncio
 import getpass
 import threading
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from shared.protocol import (
     MAX_PACKET_SIZE,
@@ -11,6 +12,52 @@ from shared.protocol import (
     read_packet,
     write_packet,
 )
+
+
+@dataclass
+class ChatTarget:
+    chat_type: str
+    identifier: str
+    title: str
+    is_member: bool = True
+
+
+@dataclass
+class ChatInterface:
+    chats: list[ChatTarget] = field(default_factory=list)
+    current: Optional[ChatTarget] = None
+    pending_open: Dict[str, ChatTarget] = field(default_factory=dict)
+
+    def update_chats(self, items: list[Dict[str, Any]]) -> None:
+        self.chats = [
+            ChatTarget(
+                chat_type=str(item.get("type", "")),
+                identifier=str(item.get("id", "")),
+                title=str(item.get("title", "")),
+                is_member=bool(item.get("is_member", False)),
+            )
+            for item in items
+            if item.get("type") in {"general", "private", "channel"}
+        ]
+
+    def show_chat_list(self) -> None:
+        print("\nВаши чаты:")
+        for index, chat in enumerate(self.chats, start=1):
+            if chat.chat_type == "general":
+                marker = "общий"
+            elif chat.chat_type == "private":
+                marker = "личный"
+            elif chat.is_member:
+                marker = "канал"
+            else:
+                marker = "доступный канал — вступление при открытии"
+            print(f"  {index}. {chat.title} ({marker})")
+        print("Команды: /open N, /create NAME, /refresh, /help, /exit")
+
+    def open_by_number(self, number: int) -> ChatTarget:
+        if number < 1 or number > len(self.chats):
+            raise ValueError("Чата с таким номером нет.")
+        return self.chats[number - 1]
 
 
 def prompt_password(action: str) -> str:
@@ -47,7 +94,7 @@ def read_console(
             return
 
 
-def display_packet(packet: Dict[str, Any]) -> None:
+def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
     packet_type = packet.get("type")
     if packet_type == "message":
         print(f"[{packet.get('sender', '?')}] {packet.get('text', '')}")
@@ -64,13 +111,21 @@ def display_packet(packet: Dict[str, Any]) -> None:
     elif packet_type == "system":
         print(f"[Система] {packet.get('text', '')}")
     elif packet_type == "error":
+        request_id = packet.get("request_id")
+        if isinstance(request_id, str):
+            interface.pending_open.pop(request_id, None)
         print(
             f"[Ошибка: {packet.get('code', 'unknown')}] "
             f"{packet.get('message', '')}"
         )
     elif packet_type == "response":
         action = packet.get("action")
-        if action == "list_users":
+        if action == "list_chats":
+            chats = packet.get("chats", [])
+            if isinstance(chats, list):
+                interface.update_chats(chats)
+                interface.show_chat_list()
+        elif action == "list_users":
             users = packet.get("users", [])
             print("Пользователи онлайн: " + (", ".join(users) or "нет"))
         elif action == "list_channels":
@@ -84,24 +139,38 @@ def display_packet(packet: Dict[str, Any]) -> None:
                     f"участников: {channel.get('member_count', 0)}"
                 )
         elif action == "create_channel":
-            print(f"Канал #{packet.get('channel')} создан.")
+            channel = str(packet.get("channel", ""))
+            interface.current = ChatTarget(
+                "channel", channel.casefold(), channel, True
+            )
+            print(f"Канал #{channel} создан и открыт. /back — к списку чатов.")
         elif action == "join_channel":
-            print(f"Вы вступили в канал #{packet.get('channel')}.")
+            request_id = packet.get("request_id")
+            target = (
+                interface.pending_open.pop(request_id, None)
+                if isinstance(request_id, str)
+                else None
+            )
+            if target is not None:
+                target.is_member = True
+                interface.current = target
+                print(f"Открыт канал #{target.title}. /back — к списку чатов.")
+            else:
+                print(f"Вы вступили в канал #{packet.get('channel')}.")
         elif action == "leave_channel":
             print(f"Вы вышли из канала #{packet.get('channel')}.")
 
 
 def print_help() -> None:
-    print("Команды:")
-    print("  обычный текст              сообщение в общий чат")
-    print("  /users                     пользователи онлайн")
-    print("  /msg USER TEXT             личное сообщение")
-    print("  /channels                  список каналов")
-    print("  /create CHANNEL            создать канал")
-    print("  /join CHANNEL              вступить в канал")
-    print("  /leave CHANNEL             выйти из канала")
-    print("  /channel CHANNEL TEXT      сообщение в канал")
-    print("  /exit                      выйти из чата")
+    print("Команды списка чатов:")
+    print("  /open N                    открыть чат по номеру")
+    print("  /create NAME               создать и открыть канал")
+    print("  /refresh                   обновить список")
+    print("Команды внутри открытого чата:")
+    print("  обычный текст              отправить сообщение в текущий чат")
+    print("  /leave                     выйти из текущего канала")
+    print("  /back                      вернуться к списку чатов")
+    print("Общие команды: /help, /exit")
 
 
 def build_outgoing_packet(message: str) -> Dict[str, Any]:
@@ -143,16 +212,27 @@ def build_outgoing_packet(message: str) -> Dict[str, Any]:
     raise ValueError("Неизвестная команда или неверное количество аргументов.")
 
 
-async def receive_packets(reader: asyncio.StreamReader) -> None:
+async def receive_packets(
+    reader: asyncio.StreamReader, interface: ChatInterface
+) -> None:
     while True:
         packet = await read_packet(reader)
         if packet is None:
             return
-        display_packet(packet)
+        display_packet(packet, interface)
+
+
+async def request_chat_list(writer: asyncio.StreamWriter) -> None:
+    await write_packet(
+        writer,
+        {"type": "list_chats", "request_id": new_request_id()},
+    )
 
 
 async def send_messages(
-    writer: asyncio.StreamWriter, messages: asyncio.Queue[str]
+    writer: asyncio.StreamWriter,
+    messages: asyncio.Queue[str],
+    interface: ChatInterface,
 ) -> None:
     while True:
         message = await messages.get()
@@ -165,12 +245,103 @@ async def send_messages(
             print_help()
             continue
 
-        try:
-            packet = build_outgoing_packet(message)
-        except ValueError as error:
-            print(f"Ошибка команды: {error} Используйте /help.")
+        if message.casefold() in {"/back", "/chats"}:
+            interface.current = None
+            await request_chat_list(writer)
             continue
+
+        if message.casefold() == "/refresh":
+            await request_chat_list(writer)
+            continue
+
+        if message.casefold().startswith("/open "):
+            try:
+                number = int(message.split(maxsplit=1)[1])
+                target = interface.open_by_number(number)
+            except (ValueError, IndexError) as error:
+                print(f"Не удалось открыть чат: {error}")
+                continue
+
+            if target.chat_type == "channel" and not target.is_member:
+                request_id = new_request_id()
+                interface.pending_open[request_id] = target
+                await write_packet(
+                    writer,
+                    {
+                        "type": "join_channel",
+                        "request_id": request_id,
+                        "channel": target.identifier,
+                    },
+                )
+                print(f"Вступаем в канал #{target.title}...")
+            else:
+                interface.current = target
+                print(f"Открыт чат «{target.title}». /back — к списку чатов.")
+            continue
+
+        if message.casefold().startswith("/create "):
+            channel = message.split(maxsplit=1)[1].strip()
+            if not channel:
+                print("Укажите название канала: /create NAME")
+                continue
+            await write_packet(
+                writer,
+                {
+                    "type": "create_channel",
+                    "request_id": new_request_id(),
+                    "channel": channel,
+                },
+            )
+            continue
+
+        if message.casefold() == "/leave":
+            if interface.current is None or interface.current.chat_type != "channel":
+                print("Команда /leave доступна только внутри канала.")
+                continue
+            await write_packet(
+                writer,
+                {
+                    "type": "leave_channel",
+                    "request_id": new_request_id(),
+                    "channel": interface.current.identifier,
+                },
+            )
+            interface.current = None
+            await request_chat_list(writer)
+            continue
+
+        if interface.current is None:
+            print("Сначала откройте чат командой /open N или создайте /create NAME.")
+            continue
+
+        if message.startswith("/"):
+            print("Неизвестная команда. Используйте /help.")
+            continue
+
+        request_id = new_request_id()
+        if interface.current.chat_type == "general":
+            packet = {
+                "type": "chat_message",
+                "request_id": request_id,
+                "text": message,
+            }
+        elif interface.current.chat_type == "private":
+            packet = {
+                "type": "private_message",
+                "request_id": request_id,
+                "recipient": interface.current.identifier,
+                "text": message,
+            }
+        else:
+            packet = {
+                "type": "channel_message",
+                "request_id": request_id,
+                "channel": interface.current.identifier,
+                "text": message,
+            }
         await write_packet(writer, packet)
+        continue
+
 
 
 async def authenticate(
@@ -272,17 +443,19 @@ async def run_client(host: str, port: int, action: str) -> None:
     try:
         authenticated_name = await authenticate(reader, writer, action)
         print(f"Вы подключены к {host}:{port} как {authenticated_name}.")
-        print("Введите сообщение или /help для списка команд.")
+        print("Загружаем список чатов...")
 
         messages: asyncio.Queue[str] = asyncio.Queue()
+        interface = ChatInterface()
         threading.Thread(
             target=read_console,
             args=(asyncio.get_running_loop(), messages),
             daemon=True,
         ).start()
 
-        receiver = asyncio.create_task(receive_packets(reader))
-        sender = asyncio.create_task(send_messages(writer, messages))
+        await request_chat_list(writer)
+        receiver = asyncio.create_task(receive_packets(reader, interface))
+        sender = asyncio.create_task(send_messages(writer, messages, interface))
         done, pending = await asyncio.wait(
             {receiver, sender}, return_when=asyncio.FIRST_COMPLETED
         )

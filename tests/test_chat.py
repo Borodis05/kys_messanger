@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from client.client import build_outgoing_packet, prompt_password
+from client.client import ChatInterface, build_outgoing_packet, prompt_password
 from server import server as chat_server
 from server.auth import verify_password
 from shared.protocol import MAX_PACKET_SIZE, read_packet, write_packet
@@ -243,6 +243,46 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await alice_writer.wait_closed()
         await bob_writer.wait_closed()
 
+    async def test_chat_list_contains_general_private_and_channel_chats(self) -> None:
+        alice_reader, alice_writer = await self.authenticate(
+            "register", "Alice", "alice"
+        )
+        await read_packet(alice_reader)
+        bob_reader, bob_writer = await self.authenticate("register", "Bob", "bob")
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "create_channel",
+                "request_id": "create-1",
+                "channel": "Developers",
+            },
+        )
+        await read_packet(alice_reader)
+
+        await write_packet(
+            bob_writer,
+            {"type": "list_chats", "request_id": "chats-1"},
+        )
+        response = await read_packet(bob_reader)
+        chats = response["chats"]
+
+        self.assertEqual(chats[0]["type"], "general")
+        self.assertTrue(chats[0]["is_member"])
+        self.assertTrue(
+            any(chat["type"] == "private" and chat["title"] == "Alice" for chat in chats)
+        )
+        developers = next(chat for chat in chats if chat["title"] == "Developers")
+        self.assertEqual(developers["type"], "channel")
+        self.assertFalse(developers["is_member"])
+
+        alice_writer.close()
+        bob_writer.close()
+        await alice_writer.wait_closed()
+        await bob_writer.wait_closed()
+
     async def test_duplicate_username_is_rejected_before_password(self) -> None:
         alice_reader, alice_writer = await self.authenticate(
             "register", "Alice", "alice"
@@ -347,6 +387,22 @@ class CommandParserTest(unittest.TestCase):
         self.assertEqual(packet["type"], "channel_message")
         self.assertEqual(packet["channel"], "Developers")
         self.assertEqual(packet["text"], "release ready")
+
+    def test_numbered_chat_can_be_opened(self) -> None:
+        interface = ChatInterface()
+        interface.update_chats(
+            [
+                {
+                    "type": "general",
+                    "id": "general",
+                    "title": "Общий чат",
+                    "is_member": True,
+                }
+            ]
+        )
+        selected = interface.open_by_number(1)
+        self.assertEqual(selected.chat_type, "general")
+        self.assertEqual(selected.title, "Общий чат")
 
 
 if __name__ == "__main__":

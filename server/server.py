@@ -309,6 +309,41 @@ async def process_client_packet(
         await send_success(writer, request_id, "list_users", users=users)
         return
 
+    if packet_type == "list_chats":
+        channels = await asyncio.to_thread(DATABASE.list_channels, username)
+        chats = [
+            {
+                "type": "general",
+                "id": "general",
+                "title": "Общий чат",
+                "is_member": True,
+            }
+        ]
+        chats.extend(
+            {
+                "type": "private",
+                "id": online_username,
+                "title": session.display_name,
+                "is_member": True,
+            }
+            for online_username, session in sorted(
+                CLIENTS.items(), key=lambda item: item[1].display_name.casefold()
+            )
+            if online_username != username
+        )
+        chats.extend(
+            {
+                "type": "channel",
+                "id": channel.name,
+                "title": channel.display_name,
+                "is_member": channel.is_member,
+                "member_count": channel.member_count,
+            }
+            for channel in channels
+        )
+        await send_success(writer, request_id, "list_chats", chats=chats)
+        return
+
     if packet_type == "private_message":
         message = require_message(packet)
         try:
