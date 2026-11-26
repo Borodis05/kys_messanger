@@ -1,53 +1,97 @@
 import argparse
-import socket
+import asyncio
+from typing import Optional
 
 
-BUFFER_SIZE = 4096
+MAX_NAME_LENGTH = 32
+MAX_MESSAGE_LENGTH = 2000
+CLIENTS: dict[str, asyncio.StreamWriter] = {}
 
 
-def handle_client(client_socket: socket.socket, client_address: tuple[str, int]) -> None:
-    """Receive newline-delimited messages from one connected client."""
-    print(f"[+] Клиент подключён: {client_address[0]}:{client_address[1]}")
+async def send_line(writer: asyncio.StreamWriter, text: str) -> None:
+    writer.write(f"{text}\n".encode("utf-8"))
+    await writer.drain()
 
-    with client_socket:
-        reader = client_socket.makefile("r", encoding="utf-8", newline="\n")
 
+async def broadcast(text: str) -> None:
+    """Send a message to every currently connected client."""
+    disconnected: list[str] = []
+
+    for name, writer in list(CLIENTS.items()):
         try:
-            for line in reader:
-                message = line.rstrip("\r\n")
-                if not message:
-                    continue
+            await send_line(writer, text)
+        except (ConnectionError, OSError):
+            disconnected.append(name)
 
-                print(f"[{client_address[0]}:{client_address[1]}] {message}")
-
-                response = f"Сервер получил: {message}\n"
-                client_socket.sendall(response.encode("utf-8"))
-        except (ConnectionError, OSError) as error:
-            print(f"[!] Ошибка соединения с клиентом: {error}")
-        finally:
-            reader.close()
-            print(f"[-] Клиент отключён: {client_address[0]}:{client_address[1]}")
+    for name in disconnected:
+        CLIENTS.pop(name, None)
 
 
-def run_server(host: str, port: int) -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((host, port))
-        server_socket.listen(1)
+async def handle_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    address = writer.get_extra_info("peername")
+    nickname: Optional[str] = None
+    print(f"[+] Новое подключение: {address}")
 
-        print(f"Сервер запущен на {host}:{port}")
-        print("Ожидание клиента. Для остановки нажмите Ctrl+C.")
+    try:
+        raw_name = await asyncio.wait_for(reader.readline(), timeout=30)
+        nickname = raw_name.decode("utf-8").strip()
 
+        if not nickname or len(nickname) > MAX_NAME_LENGTH:
+            await send_line(writer, "ERROR Имя должно содержать от 1 до 32 символов.")
+            return
+        if nickname in CLIENTS:
+            await send_line(writer, "ERROR Пользователь с таким именем уже подключён.")
+            return
+
+        CLIENTS[nickname] = writer
+        await send_line(writer, "OK")
+        print(f"[+] Пользователь вошёл: {nickname} ({address})")
+        await broadcast(f"[Система] {nickname} присоединился к чату.")
+
+        while raw_message := await reader.readline():
+            message = raw_message.decode("utf-8").strip()
+            if not message:
+                continue
+            if len(message) > MAX_MESSAGE_LENGTH:
+                await send_line(
+                    writer,
+                    f"[Система] Сообщение длиннее {MAX_MESSAGE_LENGTH} символов.",
+                )
+                continue
+
+            print(f"[{nickname}] {message}")
+            await broadcast(f"[{nickname}] {message}")
+    except asyncio.TimeoutError:
+        await send_line(writer, "ERROR Время ожидания имени истекло.")
+    except (ConnectionError, UnicodeError, OSError) as error:
+        print(f"[!] Ошибка соединения с {address}: {error}")
+    finally:
+        if nickname and CLIENTS.get(nickname) is writer:
+            CLIENTS.pop(nickname, None)
+            print(f"[-] Пользователь вышел: {nickname}")
+            await broadcast(f"[Система] {nickname} покинул чат.")
+
+        writer.close()
         try:
-            while True:
-                client_socket, client_address = server_socket.accept()
-                handle_client(client_socket, client_address)
-        except KeyboardInterrupt:
-            print("\nСервер остановлен.")
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+
+
+async def run_server(host: str, port: int) -> None:
+    server = await asyncio.start_server(handle_client, host, port)
+    addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    print(f"Сервер запущен: {addresses}")
+    print("Ожидание клиентов. Для остановки нажмите Ctrl+C.")
+
+    async with server:
+        await server.serve_forever()
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Простой TCP-сервер чата")
+    parser = argparse.ArgumentParser(description="Асинхронный TCP-сервер чата")
     parser.add_argument("--host", default="127.0.0.1", help="Адрес для прослушивания")
     parser.add_argument("--port", type=int, default=8888, help="TCP-порт")
     return parser.parse_args()
@@ -55,4 +99,7 @@ def parse_arguments() -> argparse.Namespace:
 
 if __name__ == "__main__":
     arguments = parse_arguments()
-    run_server(arguments.host, arguments.port)
+    try:
+        asyncio.run(run_server(arguments.host, arguments.port))
+    except KeyboardInterrupt:
+        print("\nСервер остановлен.")
