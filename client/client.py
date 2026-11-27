@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import getpass
+import json
+import ssl
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -15,6 +17,8 @@ from shared.protocol import (
     read_packet,
     write_packet,
 )
+from shared.tls import TLSConfigurationError, create_client_tls_context
+from shared.runtime import application_directory, runtime_path
 
 
 @dataclass
@@ -631,12 +635,37 @@ async def authenticate(
             return authenticated_name
 
 
-async def run_client(host: str, port: int, action: str) -> None:
+async def run_client(
+    host: str,
+    port: int,
+    action: str,
+    cafile: str,
+    server_name: Optional[str],
+) -> None:
+    try:
+        tls_context = create_client_tls_context(cafile)
+    except TLSConfigurationError as error:
+        print(f"Ошибка TLS: {error}")
+        return
+
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, limit=MAX_PACKET_SIZE + 1),
+            asyncio.open_connection(
+                host,
+                port,
+                limit=MAX_PACKET_SIZE + 1,
+                ssl=tls_context,
+                server_hostname=server_name or host,
+                ssl_handshake_timeout=10,
+            ),
             timeout=10,
         )
+    except ssl.SSLCertVerificationError as error:
+        print(f"Сертификат сервера не прошёл проверку: {error}")
+        return
+    except ssl.SSLError as error:
+        print(f"Не удалось установить защищённое соединение: {error}")
+        return
     except ConnectionRefusedError:
         print(f"Не удалось подключиться: сервер {host}:{port} не запущен.")
         return
@@ -646,7 +675,12 @@ async def run_client(host: str, port: int, action: str) -> None:
 
     try:
         authenticated_name = await authenticate(reader, writer, action)
-        print(f"Вы подключены к {host}:{port} как {authenticated_name}.")
+        tls_session = writer.get_extra_info("ssl_object")
+        tls_version = tls_session.version() if tls_session else "неизвестно"
+        print(
+            f"Вы подключены к {host}:{port} как {authenticated_name}. "
+            f"Защита: {tls_version}."
+        )
         print("Загружаем список чатов...")
 
         messages: asyncio.Queue[str] = asyncio.Queue()
@@ -686,7 +720,17 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Консольный TCP-клиент чата")
     parser.add_argument("--host", default="127.0.0.1", help="Адрес сервера")
     parser.add_argument("--port", type=int, default=8888, help="TCP-порт сервера")
-    commands = parser.add_subparsers(dest="action", required=True)
+    parser.add_argument(
+        "--cafile",
+        default="certs/ca.crt",
+        help="Сертификат доверенного локального CA",
+    )
+    parser.add_argument(
+        "--server-name",
+        default=None,
+        help="Имя или IP из сертификата сервера (по умолчанию --host)",
+    )
+    commands = parser.add_subparsers(dest="action")
 
     register_parser = commands.add_parser("register", help="Создать учётную запись")
 
@@ -694,9 +738,86 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_client_settings() -> Dict[str, Any]:
+    settings_path = application_directory() / "client-settings.json"
+    try:
+        with settings_path.open("r", encoding="utf-8") as settings_file:
+            settings = json.load(settings_file)
+        return settings if isinstance(settings, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_client_settings(host: str, port: int) -> None:
+    settings_path = application_directory() / "client-settings.json"
+    try:
+        with settings_path.open("w", encoding="utf-8") as settings_file:
+            json.dump(
+                {"host": host, "port": port},
+                settings_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except OSError as error:
+        print(f"Не удалось сохранить настройки клиента: {error}")
+
+
+def configure_interactively(arguments: argparse.Namespace) -> None:
+    settings = load_client_settings()
+    default_host = str(settings.get("host") or arguments.host)
+    try:
+        default_port = int(settings.get("port") or arguments.port)
+    except (TypeError, ValueError):
+        default_port = arguments.port
+
+    print("КОРПОРАТИВНЫЙ ЧАТ")
+    print("Первичная настройка подключения")
+    entered_host = input(f"Адрес сервера [{default_host}]: ").strip()
+    arguments.host = entered_host or default_host
+
+    entered_port = input(f"Порт [{default_port}]: ").strip()
+    if entered_port:
+        try:
+            arguments.port = int(entered_port)
+        except ValueError:
+            print(f"Некорректный порт, используется {default_port}.")
+            arguments.port = default_port
+    else:
+        arguments.port = default_port
+
+    while True:
+        choice = input("1 — войти, 2 — зарегистрироваться: ").strip()
+        if choice == "1":
+            arguments.action = "login"
+            break
+        if choice == "2":
+            arguments.action = "register"
+            break
+        print("Введите 1 или 2.")
+
+    save_client_settings(arguments.host, arguments.port)
+
+
 if __name__ == "__main__":
     arguments = parse_arguments()
+    interactive_launch = arguments.action is None
     try:
-        asyncio.run(run_client(arguments.host, arguments.port, arguments.action))
+        if interactive_launch:
+            configure_interactively(arguments)
+        asyncio.run(
+            run_client(
+                arguments.host,
+                arguments.port,
+                arguments.action,
+                runtime_path(arguments.cafile),
+                arguments.server_name,
+            )
+        )
     except KeyboardInterrupt:
         print("\nКлиент остановлен.")
+    finally:
+        if interactive_launch:
+            try:
+                input("Нажмите Enter, чтобы закрыть окно...")
+            except (EOFError, KeyboardInterrupt):
+                pass

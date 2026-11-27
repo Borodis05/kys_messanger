@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import re
+import ssl
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
@@ -15,6 +16,11 @@ from server.auth import (
 )
 from server.database import Database, Message, User
 from shared.protocol import MAX_PACKET_SIZE, ProtocolError, read_packet, write_packet
+from shared.runtime import runtime_path
+from shared.tls import (
+    TLSConfigurationError,
+    create_server_tls_context,
+)
 
 
 MAX_MESSAGE_LENGTH = 2000
@@ -629,7 +635,13 @@ async def handle_client(
     address = writer.get_extra_info("peername")
     username: Optional[str] = None
     display_name: Optional[str] = None
-    print(f"[+] Новое подключение: {address}")
+    tls_session = writer.get_extra_info("ssl_object")
+    tls_description = (
+        f"{tls_session.version()} / {tls_session.cipher()[0]}"
+        if tls_session is not None
+        else "без TLS"
+    )
+    print(f"[+] Новое подключение: {address} ({tls_description})")
 
     try:
         try:
@@ -705,14 +717,22 @@ async def handle_client(
             pass
 
 
-async def run_server(host: str, port: int) -> None:
+async def run_server(
+    host: str, port: int, tls_context: ssl.SSLContext
+) -> None:
     await asyncio.to_thread(DATABASE.initialize)
     server = await asyncio.start_server(
-        handle_client, host, port, limit=MAX_PACKET_SIZE + 1
+        handle_client,
+        host,
+        port,
+        limit=MAX_PACKET_SIZE + 1,
+        ssl=tls_context,
+        ssl_handshake_timeout=10,
     )
     addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     print(f"Сервер запущен: {addresses}")
     print(f"База данных: {DATABASE.path}")
+    print("Защищённое соединение: TLS 1.2+")
     print("Ожидание клиентов. Для остановки нажмите Ctrl+C.")
 
     async with server:
@@ -721,18 +741,40 @@ async def run_server(host: str, port: int) -> None:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Асинхронный TCP-сервер чата")
-    parser.add_argument("--host", default="127.0.0.1", help="Адрес для прослушивания")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Адрес для прослушивания (по умолчанию вся локальная сеть)",
+    )
     parser.add_argument("--port", type=int, default=8888, help="TCP-порт")
     parser.add_argument(
         "--database", default="data/chat.db", help="Путь к базе данных SQLite"
+    )
+    parser.add_argument(
+        "--certfile",
+        default="certs/server.crt",
+        help="Сертификат TLS-сервера",
+    )
+    parser.add_argument(
+        "--keyfile",
+        default="certs/server.key",
+        help="Закрытый ключ TLS-сервера",
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = parse_arguments()
-    DATABASE = Database(arguments.database)
+    DATABASE = Database(runtime_path(arguments.database))
     try:
-        asyncio.run(run_server(arguments.host, arguments.port))
+        server_tls_context = create_server_tls_context(
+            runtime_path(arguments.certfile), runtime_path(arguments.keyfile)
+        )
+        asyncio.run(
+            run_server(arguments.host, arguments.port, server_tls_context)
+        )
+    except TLSConfigurationError as error:
+        print(f"Ошибка TLS: {error}")
+        raise SystemExit(2)
     except KeyboardInterrupt:
         print("\nСервер остановлен.")
