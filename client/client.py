@@ -1,9 +1,12 @@
 import argparse
 import asyncio
 import getpass
-import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set, Tuple
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import clear as clear_terminal
 
 from shared.protocol import (
     MAX_PACKET_SIZE,
@@ -24,12 +27,16 @@ class ChatTarget:
 
 @dataclass
 class ChatInterface:
+    own_display_name: str = ""
     chats: list[ChatTarget] = field(default_factory=list)
     current: Optional[ChatTarget] = None
     pending_open: Dict[str, ChatTarget] = field(default_factory=dict)
+    unread: Set[Tuple[str, str]] = field(default_factory=set)
+    message_lines: list[str] = field(default_factory=list)
 
-    def update_chats(self, items: list[Dict[str, Any]]) -> None:
-        self.chats = [
+    def update_chats(self, items: list[Dict[str, Any]]) -> bool:
+        previous_unread = set(self.unread)
+        updated_chats = [
             ChatTarget(
                 chat_type=str(item.get("type", "")),
                 identifier=str(item.get("id", "")),
@@ -39,25 +46,88 @@ class ChatInterface:
             for item in items
             if item.get("type") in {"general", "private", "channel"}
         ]
+        changed = updated_chats != self.chats
+        self.chats = updated_chats
+        for item, chat in zip(items, updated_chats):
+            if int(item.get("unread_count", 0) or 0) > 0:
+                self.unread.add(self.chat_key(chat))
+        return changed or self.unread != previous_unread
 
-    def show_chat_list(self) -> None:
-        print("\nВаши чаты:")
+    @staticmethod
+    def chat_key(chat: ChatTarget) -> Tuple[str, str]:
+        return chat.chat_type, chat.identifier.casefold()
+
+    def render_chat_list(self) -> None:
+        clear_screen()
+        print("КОРПОРАТИВНЫЙ ЧАТ — СПИСОК ДИАЛОГОВ")
+        number_width = 3
+        title_width = 28
+        type_width = 18
+        unread_width = 5
+        separator = (
+            f"+-{'-' * number_width}-+-{'-' * title_width}-+"
+            f"-{'-' * type_width}-+-{'-' * unread_width}-+"
+        )
+        print(separator)
+        print(
+            f"| {'#':^{number_width}} | {'Чат':<{title_width}} | "
+            f"{'Тип':<{type_width}} | {'Новое':<{unread_width}} |"
+        )
+        print(separator)
         for index, chat in enumerate(self.chats, start=1):
             if chat.chat_type == "general":
-                marker = "общий"
+                chat_type = "Общий"
             elif chat.chat_type == "private":
-                marker = "личный"
+                chat_type = "Личный"
             elif chat.is_member:
-                marker = "канал"
+                chat_type = "Канал"
             else:
-                marker = "доступный канал — вступление при открытии"
-            print(f"  {index}. {chat.title} ({marker})")
-        print("Команды: /open N, /create NAME, /refresh, /help, /exit")
+                chat_type = "Доступный канал"
+            unread = "!" if self.chat_key(chat) in self.unread else ""
+            print(
+                f"| {index:>{number_width}} | "
+                f"{truncate(chat.title, title_width):<{title_width}} | "
+                f"{chat_type:<{type_width}} | {unread:^{unread_width}} |"
+            )
+        print(separator)
+
+    def render_current_chat(self, loading: bool = False) -> None:
+        if self.current is None:
+            return
+        clear_screen()
+        title = truncate(self.current.title, 54)
+        print("╔" + "═" * 58 + "╗")
+        print(f"║ {title:^56} ║")
+        print("╚" + "═" * 58 + "╝")
+        print("─" * 60)
+        if loading:
+            print("Загрузка истории...")
+        else:
+            for line in self.message_lines:
+                print(line)
+
+    def select_chat(self, chat: ChatTarget) -> None:
+        self.current = chat
+        self.unread.discard(self.chat_key(chat))
+        self.message_lines.clear()
+        self.render_current_chat(loading=True)
 
     def open_by_number(self, number: int) -> ChatTarget:
         if number < 1 or number > len(self.chats):
             raise ValueError("Чата с таким номером нет.")
         return self.chats[number - 1]
+
+
+def clear_screen() -> None:
+    try:
+        clear_terminal()
+    except Exception:
+        # IDE output panes and redirected streams may not expose a console buffer.
+        print("\n" * 3, end="")
+
+
+def truncate(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def prompt_password(action: str) -> str:
@@ -76,40 +146,88 @@ def prompt_username() -> str:
     return input("Имя пользователя: ").strip()
 
 
-def read_console(
-    loop: asyncio.AbstractEventLoop, messages: asyncio.Queue[str]
+def bottom_toolbar(interface: ChatInterface) -> str:
+    if interface.current is None:
+        return " /open N   /new USER   /create NAME   /help   /exit "
+    return " /back   /history   /help   /exit "
+
+
+async def read_console(
+    messages: asyncio.Queue[str], interface: ChatInterface
 ) -> None:
+    session: PromptSession[str] = PromptSession()
     while True:
         try:
-            message = input("> ").strip()
+            with patch_stdout():
+                message = (
+                    await session.prompt_async(
+                        "> ",
+                        bottom_toolbar=lambda: bottom_toolbar(interface),
+                    )
+                ).strip()
         except (EOFError, KeyboardInterrupt):
             message = "/exit"
 
-        try:
-            loop.call_soon_threadsafe(messages.put_nowait, message)
-        except RuntimeError:
-            return
-
+        await messages.put(message)
         if message == "/exit":
             return
 
 
-def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
+def packet_chat_key(
+    packet: Dict[str, Any], interface: ChatInterface
+) -> Optional[Tuple[str, str]]:
     packet_type = packet.get("type")
     if packet_type == "message":
-        print(f"[{packet.get('sender', '?')}] {packet.get('text', '')}")
-    elif packet_type == "private_message":
-        print(
-            f"[Личное: {packet.get('sender', '?')} → "
-            f"{packet.get('recipient', '?')}] {packet.get('text', '')}"
+        return "general", "general"
+    if packet_type == "channel_message":
+        channel = packet.get("channel_id", packet.get("channel", ""))
+        return "channel", str(channel).casefold()
+    if packet_type == "private_message":
+        sender = str(packet.get("sender_id", ""))
+        recipient = str(packet.get("recipient_id", ""))
+        own_name = interface.own_display_name.casefold()
+        if str(packet.get("sender", "")).casefold() == own_name:
+            contact = recipient
+        else:
+            contact = sender
+        return "private", contact.casefold()
+    return None
+
+
+def format_live_message(packet: Dict[str, Any]) -> str:
+    return format_message_line(
+        str(packet.get("sent_at", "")),
+        str(packet.get("sender", "?")),
+        str(packet.get("text", "")),
+    )
+
+
+def format_message_line(timestamp: str, sender: str, text: str) -> str:
+    if len(timestamp) >= 16:
+        displayed_time = f"{timestamp[8:10]}.{timestamp[5:7]} {timestamp[11:16]}"
+    else:
+        displayed_time = timestamp
+    return f"[{displayed_time}] {sender}: {text}"
+
+
+def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
+    packet_type = packet.get("type")
+    if packet_type in {"message", "private_message", "channel_message"}:
+        chat_key = packet_chat_key(packet, interface)
+        current_key = (
+            interface.chat_key(interface.current) if interface.current else None
         )
-    elif packet_type == "channel_message":
-        print(
-            f"[#{packet.get('channel', '?')}] "
-            f"{packet.get('sender', '?')}: {packet.get('text', '')}"
-        )
-    elif packet_type == "system":
-        print(f"[Система] {packet.get('text', '')}")
+        if chat_key == current_key:
+            interface.message_lines.append(format_live_message(packet))
+            interface.message_lines = interface.message_lines[-50:]
+            interface.render_current_chat()
+        elif chat_key is not None:
+            interface.unread.add(chat_key)
+            if interface.current is None:
+                interface.render_chat_list()
+        return
+    if packet_type == "system":
+        return
     elif packet_type == "error":
         request_id = packet.get("request_id")
         if isinstance(request_id, str):
@@ -123,8 +241,9 @@ def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
         if action == "list_chats":
             chats = packet.get("chats", [])
             if isinstance(chats, list):
-                interface.update_chats(chats)
-                interface.show_chat_list()
+                changed = interface.update_chats(chats)
+                if interface.current is None and changed:
+                    interface.render_chat_list()
         elif action == "list_users":
             users = packet.get("users", [])
             print("Пользователи онлайн: " + (", ".join(users) or "нет"))
@@ -140,10 +259,15 @@ def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
                 )
         elif action == "create_channel":
             channel = str(packet.get("channel", ""))
-            interface.current = ChatTarget(
-                "channel", channel.casefold(), channel, True
+            interface.select_chat(
+                ChatTarget("channel", channel.casefold(), channel, True)
             )
-            print(f"Канал #{channel} создан и открыт. /back — к списку чатов.")
+        elif action == "open_private_chat":
+            recipient = str(packet.get("recipient", ""))
+            title = str(packet.get("title", recipient))
+            interface.select_chat(
+                ChatTarget("private", recipient.casefold(), title, True)
+            )
         elif action == "join_channel":
             request_id = packet.get("request_id")
             target = (
@@ -153,8 +277,7 @@ def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
             )
             if target is not None:
                 target.is_member = True
-                interface.current = target
-                print(f"Открыт канал #{target.title}. /back — к списку чатов.")
+                interface.select_chat(target)
             else:
                 print(f"Вы вступили в канал #{packet.get('channel')}.")
         elif action == "leave_channel":
@@ -162,22 +285,38 @@ def display_packet(packet: Dict[str, Any], interface: ChatInterface) -> None:
         elif action == "get_history":
             title = packet.get("title", "Чат")
             messages = packet.get("messages", [])
-            print(f"\n── История: {title} ──")
+            response_key = (
+                str(packet.get("chat_type", "")),
+                str(packet.get("target", "")).casefold(),
+            )
+            current_key = (
+                interface.chat_key(interface.current) if interface.current else None
+            )
+            if response_key != current_key:
+                return
+            history_lines = [f"История: {title}"]
             if not messages:
-                print("Сообщений пока нет.")
+                history_lines.append("Сообщений пока нет.")
+            unread_header_printed = False
             for message in messages:
-                timestamp = str(message.get("sent_at", ""))
-                short_time = timestamp[11:16] if len(timestamp) >= 16 else timestamp
-                print(
-                    f"[{short_time}] {message.get('sender', '?')}: "
-                    f"{message.get('text', '')}"
+                if message.get("is_unread") and not unread_header_printed:
+                    history_lines.append("── НОВЫЕ СООБЩЕНИЯ ──")
+                    unread_header_printed = True
+                history_lines.append(
+                    format_message_line(
+                        str(message.get("sent_at", "")),
+                        str(message.get("sender", "?")),
+                        str(message.get("text", "")),
+                    )
                 )
-            print("── Новые сообщения ──")
+            interface.message_lines = history_lines
+            interface.render_current_chat()
 
 
 def print_help() -> None:
     print("Команды списка чатов:")
     print("  /open N                    открыть чат по номеру")
+    print("  /new USER                  начать личный диалог")
     print("  /create NAME               создать и открыть канал")
     print("  /refresh                   обновить список")
     print("Команды внутри открытого чата:")
@@ -238,7 +377,7 @@ async def receive_packets(
             return
         action = packet.get("action") if packet.get("type") == "response" else None
         display_packet(packet, interface)
-        if action in {"create_channel", "join_channel"} and interface.current:
+        if action in {"create_channel", "join_channel", "open_private_chat"} and interface.current:
             await request_history(writer, interface.current)
 
 
@@ -247,6 +386,12 @@ async def request_chat_list(writer: asyncio.StreamWriter) -> None:
         writer,
         {"type": "list_chats", "request_id": new_request_id()},
     )
+
+
+async def auto_refresh_chat_list(writer: asyncio.StreamWriter) -> None:
+    while True:
+        await asyncio.sleep(3)
+        await request_chat_list(writer)
 
 
 async def request_history(
@@ -281,10 +426,13 @@ async def send_messages(
 
         if message.casefold() in {"/back", "/chats"}:
             interface.current = None
+            interface.render_chat_list()
             await request_chat_list(writer)
             continue
 
         if message.casefold() == "/refresh":
+            if interface.current is None:
+                interface.render_chat_list()
             await request_chat_list(writer)
             continue
 
@@ -316,8 +464,7 @@ async def send_messages(
                 )
                 print(f"Вступаем в канал #{target.title}...")
             else:
-                interface.current = target
-                print(f"Открыт чат «{target.title}». /back — к списку чатов.")
+                interface.select_chat(target)
                 await request_history(writer, target)
             continue
 
@@ -332,6 +479,21 @@ async def send_messages(
                     "type": "create_channel",
                     "request_id": new_request_id(),
                     "channel": channel,
+                },
+            )
+            continue
+
+        if message.casefold().startswith("/new "):
+            recipient = message.split(maxsplit=1)[1].strip()
+            if not recipient:
+                print("Укажите пользователя: /new USER")
+                continue
+            await write_packet(
+                writer,
+                {
+                    "type": "open_private_chat",
+                    "request_id": new_request_id(),
+                    "recipient": recipient,
                 },
             )
             continue
@@ -488,18 +650,16 @@ async def run_client(host: str, port: int, action: str) -> None:
         print("Загружаем список чатов...")
 
         messages: asyncio.Queue[str] = asyncio.Queue()
-        interface = ChatInterface()
-        threading.Thread(
-            target=read_console,
-            args=(asyncio.get_running_loop(), messages),
-            daemon=True,
-        ).start()
+        interface = ChatInterface(own_display_name=authenticated_name)
 
         await request_chat_list(writer)
+        console = asyncio.create_task(read_console(messages, interface))
         receiver = asyncio.create_task(receive_packets(reader, writer, interface))
         sender = asyncio.create_task(send_messages(writer, messages, interface))
+        refresher = asyncio.create_task(auto_refresh_chat_list(writer))
         done, pending = await asyncio.wait(
-            {receiver, sender}, return_when=asyncio.FIRST_COMPLETED
+            {console, receiver, sender, refresher},
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
         for task in pending:

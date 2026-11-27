@@ -140,7 +140,9 @@ def require_channel_name(packet: Dict[str, Any]) -> Tuple[str, str]:
     return display_name.casefold(), display_name
 
 
-def serialize_message(message: Message) -> Dict[str, Any]:
+def serialize_message(
+    message: Message, current_username: str, last_read_message_id: int
+) -> Dict[str, Any]:
     return {
         "id": message.id,
         "type": message.kind,
@@ -149,6 +151,10 @@ def serialize_message(message: Message) -> Dict[str, Any]:
         "channel": message.channel_display_name,
         "text": message.text,
         "sent_at": message.created_at,
+        "is_unread": (
+            message.id > last_read_message_id
+            and message.sender_username != current_username
+        ),
     }
 
 
@@ -345,6 +351,22 @@ async def process_client_packet(
         else:
             raise ProtocolError("invalid_chat_type", "Неизвестный тип чата.")
 
+        last_read_message_id = await asyncio.to_thread(
+            DATABASE.get_read_marker,
+            username,
+            chat_type,
+            normalized_target,
+        )
+        latest_message_id = messages[-1].id if messages else last_read_message_id
+        if latest_message_id > last_read_message_id:
+            await asyncio.to_thread(
+                DATABASE.mark_chat_read,
+                username,
+                chat_type,
+                normalized_target,
+                latest_message_id,
+            )
+
         await send_success(
             writer,
             request_id,
@@ -352,7 +374,10 @@ async def process_client_packet(
             chat_type=chat_type,
             target=normalized_target,
             title=title,
-            messages=[serialize_message(message) for message in messages],
+            messages=[
+                serialize_message(message, username, last_read_message_id)
+                for message in messages
+            ],
         )
         return
 
@@ -392,12 +417,16 @@ async def process_client_packet(
         contacts = await asyncio.to_thread(
             DATABASE.list_private_contacts, username
         )
+        unread_counts = await asyncio.to_thread(
+            DATABASE.get_unread_counts, username
+        )
         chats = [
             {
                 "type": "general",
                 "id": "general",
                 "title": "Общий чат",
                 "is_member": True,
+                "unread_count": unread_counts.get(("general", "general"), 0),
             }
         ]
         private_chats = {
@@ -406,22 +435,13 @@ async def process_client_packet(
                 "id": contact.username,
                 "title": contact.display_name,
                 "is_member": True,
+                "unread_count": unread_counts.get(
+                    ("private", contact.username), 0
+                ),
             }
             for contact in contacts
             if contact.username != username
         }
-        private_chats.update(
-            {
-                online_username: {
-                    "type": "private",
-                    "id": online_username,
-                    "title": session.display_name,
-                    "is_member": True,
-                }
-                for online_username, session in CLIENTS.items()
-                if online_username != username
-            }
-        )
         chats.extend(
             sorted(private_chats.values(), key=lambda chat: chat["title"].casefold())
         )
@@ -432,10 +452,34 @@ async def process_client_packet(
                 "title": channel.display_name,
                 "is_member": channel.is_member,
                 "member_count": channel.member_count,
+                "unread_count": unread_counts.get(
+                    ("channel", channel.name), 0
+                ),
             }
             for channel in channels
         )
         await send_success(writer, request_id, "list_chats", chats=chats)
+        return
+
+    if packet_type == "open_private_chat":
+        try:
+            recipient, _ = validate_username(packet.get("recipient"))
+        except CredentialsError as error:
+            raise ProtocolError("invalid_recipient", str(error)) from error
+        if recipient == username:
+            raise ProtocolError(
+                "invalid_recipient", "Нельзя создать личный чат с самим собой."
+            )
+        recipient_user = await asyncio.to_thread(DATABASE.get_user, recipient)
+        if recipient_user is None:
+            raise ProtocolError("user_not_found", "Пользователь не найден.")
+        await send_success(
+            writer,
+            request_id,
+            "open_private_chat",
+            recipient=recipient_user.username,
+            title=recipient_user.display_name,
+        )
         return
 
     if packet_type == "private_message":
@@ -461,7 +505,9 @@ async def process_client_packet(
         private_packet = {
             "type": "private_message",
             "id": message_id,
+            "sender_id": username,
             "sender": display_name,
+            "recipient_id": recipient,
             "recipient": recipient_user.display_name,
             "text": message,
             "sent_at": sent_at,
@@ -565,6 +611,7 @@ async def process_client_packet(
             {
                 "type": "channel_message",
                 "id": message_id,
+                "channel_id": channel_name,
                 "channel": channel.display_name or channel_display_name,
                 "sender": display_name,
                 "text": message,

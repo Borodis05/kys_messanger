@@ -1,10 +1,18 @@
 import asyncio
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from client.client import ChatInterface, build_outgoing_packet, prompt_password
+from client.client import (
+    ChatInterface,
+    bottom_toolbar,
+    build_outgoing_packet,
+    display_packet,
+    prompt_password,
+)
 from server import server as chat_server
 from server.auth import verify_password
 from shared.protocol import MAX_PACKET_SIZE, read_packet, write_packet
@@ -153,7 +161,9 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(acknowledgement["action"], "private_message")
         self.assertEqual(alice_copy["text"], "secret")
         self.assertEqual(bob_message["sender"], "Alice")
+        self.assertEqual(bob_message["sender_id"], "alice")
         self.assertEqual(bob_message["recipient"], "Bob")
+        self.assertEqual(bob_message["recipient_id"], "bob")
 
         alice_writer.close()
         bob_writer.close()
@@ -243,7 +253,7 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await alice_writer.wait_closed()
         await bob_writer.wait_closed()
 
-    async def test_chat_list_contains_general_private_and_channel_chats(self) -> None:
+    async def test_private_chat_appears_only_after_first_message(self) -> None:
         alice_reader, alice_writer = await self.authenticate(
             "register", "Alice", "alice"
         )
@@ -271,12 +281,48 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(chats[0]["type"], "general")
         self.assertTrue(chats[0]["is_member"])
-        self.assertTrue(
-            any(chat["type"] == "private" and chat["title"] == "Alice" for chat in chats)
+        self.assertFalse(
+            any(chat["type"] == "private" for chat in chats)
         )
         developers = next(chat for chat in chats if chat["title"] == "Developers")
         self.assertEqual(developers["type"], "channel")
         self.assertFalse(developers["is_member"])
+
+        await write_packet(
+            bob_writer,
+            {
+                "type": "open_private_chat",
+                "request_id": "open-private",
+                "recipient": "Alice",
+            },
+        )
+        opened = await read_packet(bob_reader)
+        self.assertEqual(opened["action"], "open_private_chat")
+
+        await write_packet(
+            bob_writer,
+            {
+                "type": "private_message",
+                "request_id": "private-1",
+                "recipient": "Alice",
+                "text": "hello",
+            },
+        )
+        await read_packet(bob_reader)
+        await read_packet(bob_reader)
+        await read_packet(alice_reader)
+
+        await write_packet(
+            bob_writer,
+            {"type": "list_chats", "request_id": "chats-2"},
+        )
+        chats_after_message = (await read_packet(bob_reader))["chats"]
+        self.assertTrue(
+            any(
+                chat["type"] == "private" and chat["title"] == "Alice"
+                for chat in chats_after_message
+            )
+        )
 
         alice_writer.close()
         bob_writer.close()
@@ -403,6 +449,58 @@ class ChatIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[-1]["text"], "message-54")
         await self.disconnect(writer)
 
+    async def test_offline_private_message_is_unread_until_history_opens(self) -> None:
+        alice_reader, alice_writer = await self.authenticate(
+            "register", "Alice", "alice"
+        )
+        await read_packet(alice_reader)
+        bob_reader, bob_writer = await self.authenticate("register", "Bob", "bob")
+        await read_packet(alice_reader)
+        await read_packet(bob_reader)
+
+        bob_writer.close()
+        await bob_writer.wait_closed()
+        await read_packet(alice_reader)
+
+        await write_packet(
+            alice_writer,
+            {
+                "type": "private_message",
+                "request_id": "offline-message",
+                "recipient": "Bob",
+                "text": "while offline",
+            },
+        )
+        await read_packet(alice_reader)
+        await read_packet(alice_reader)
+        await self.disconnect(alice_writer)
+
+        login_reader, login_writer = await self.authenticate("login", "Bob", "bob-login")
+        await read_packet(login_reader)
+        await write_packet(
+            login_writer,
+            {"type": "list_chats", "request_id": "unread-list"},
+        )
+        chats = (await read_packet(login_reader))["chats"]
+        alice_chat = next(chat for chat in chats if chat.get("id") == "alice")
+        self.assertEqual(alice_chat["unread_count"], 1)
+
+        history_request = {
+            "type": "get_history",
+            "request_id": "unread-history",
+            "chat_type": "private",
+            "target": "alice",
+        }
+        await write_packet(login_writer, history_request)
+        first_history = await read_packet(login_reader)
+        self.assertTrue(first_history["messages"][-1]["is_unread"])
+
+        history_request["request_id"] = "read-history"
+        await write_packet(login_writer, history_request)
+        second_history = await read_packet(login_reader)
+        self.assertFalse(second_history["messages"][-1]["is_unread"])
+        await self.disconnect(login_writer)
+
     async def test_duplicate_username_is_rejected_before_password(self) -> None:
         alice_reader, alice_writer = await self.authenticate(
             "register", "Alice", "alice"
@@ -496,6 +594,22 @@ class PasswordPromptTest(unittest.TestCase):
 
 
 class CommandParserTest(unittest.TestCase):
+    def test_bottom_toolbar_changes_inside_chat(self) -> None:
+        interface = ChatInterface()
+        self.assertIn("/open", bottom_toolbar(interface))
+        interface.update_chats(
+            [
+                {
+                    "type": "general",
+                    "id": "general",
+                    "title": "Общий чат",
+                    "is_member": True,
+                }
+            ]
+        )
+        interface.current = interface.open_by_number(1)
+        self.assertIn("/back", bottom_toolbar(interface))
+
     def test_private_message_command(self) -> None:
         packet = build_outgoing_packet("/msg Bob hello there")
         self.assertEqual(packet["type"], "private_message")
@@ -523,6 +637,123 @@ class CommandParserTest(unittest.TestCase):
         selected = interface.open_by_number(1)
         self.assertEqual(selected.chat_type, "general")
         self.assertEqual(selected.title, "Общий чат")
+
+    def test_unread_marker_is_cleared_when_chat_opens(self) -> None:
+        interface = ChatInterface(own_display_name="Alice")
+        interface.update_chats(
+            [
+                {
+                    "type": "private",
+                    "id": "bob",
+                    "title": "Bob",
+                    "is_member": True,
+                }
+            ]
+        )
+        display_packet(
+            {
+                "type": "private_message",
+                "sender_id": "bob",
+                "sender": "Bob",
+                "recipient_id": "alice",
+                "recipient": "Alice",
+                "text": "hello",
+            },
+            interface,
+        )
+        self.assertIn(("private", "bob"), interface.unread)
+
+        interface.select_chat(interface.open_by_number(1))
+        self.assertNotIn(("private", "bob"), interface.unread)
+
+    def test_private_messages_use_same_timestamped_format(self) -> None:
+        interface = ChatInterface(own_display_name="Alice")
+        interface.update_chats(
+            [
+                {
+                    "type": "private",
+                    "id": "bob",
+                    "title": "Bob",
+                    "is_member": True,
+                }
+            ]
+        )
+        interface.current = interface.open_by_number(1)
+
+        incoming = {
+            "type": "private_message",
+            "sender_id": "bob",
+            "sender": "Bob",
+            "recipient_id": "alice",
+            "recipient": "Alice",
+            "text": "hello",
+            "sent_at": "2026-01-01T12:34:00+00:00",
+        }
+        own_echo = {
+            "type": "private_message",
+            "sender_id": "alice",
+            "sender": "Alice",
+            "recipient_id": "bob",
+            "recipient": "Bob",
+            "text": "reply",
+            "sent_at": "2026-01-01T12:35:00+00:00",
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            display_packet(incoming, interface)
+            display_packet(own_echo, interface)
+
+        self.assertIn("[01.01 12:34] Bob: hello", output.getvalue())
+        self.assertEqual(
+            interface.message_lines,
+            ["[01.01 12:34] Bob: hello", "[01.01 12:35] Alice: reply"],
+        )
+
+    def test_history_separates_unread_messages(self) -> None:
+        interface = ChatInterface(own_display_name="Alice")
+        interface.update_chats(
+            [
+                {
+                    "type": "private",
+                    "id": "bob",
+                    "title": "Bob",
+                    "is_member": True,
+                }
+            ]
+        )
+        interface.current = interface.open_by_number(1)
+        response = {
+            "type": "response",
+            "action": "get_history",
+            "chat_type": "private",
+            "target": "bob",
+            "title": "Bob",
+            "messages": [
+                {
+                    "sender": "Alice",
+                    "text": "old",
+                    "sent_at": "2026-01-01T10:00:00+00:00",
+                    "is_unread": False,
+                },
+                {
+                    "sender": "Bob",
+                    "text": "new",
+                    "sent_at": "2026-01-01T10:05:00+00:00",
+                    "is_unread": True,
+                },
+            ],
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            display_packet(response, interface)
+
+        marker_index = interface.message_lines.index("── НОВЫЕ СООБЩЕНИЯ ──")
+        self.assertEqual(
+            interface.message_lines[marker_index + 1], "[01.01 10:05] Bob: new"
+        )
+        rendered = output.getvalue()
+        self.assertIn("[01.01 10:05] Bob: new", rendered)
+        self.assertNotIn("/back", rendered)
 
 
 if __name__ == "__main__":

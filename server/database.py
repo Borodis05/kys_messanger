@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,19 @@ class Database:
                     display_name TEXT NOT NULL,
                     password_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_read_state (
+                    username TEXT NOT NULL REFERENCES users(username)
+                        ON DELETE CASCADE,
+                    chat_type TEXT NOT NULL
+                        CHECK (chat_type IN ('general', 'private', 'channel')),
+                    target TEXT NOT NULL,
+                    last_read_message_id INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (username, chat_type, target)
                 )
                 """
             )
@@ -375,6 +388,105 @@ class Database:
             User(row["id"], row["username"], row["display_name"], row["password_hash"])
             for row in rows
         ]
+
+    def get_read_marker(self, username: str, chat_type: str, target: str) -> int:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT last_read_message_id
+                FROM chat_read_state
+                WHERE username = ? AND chat_type = ? AND target = ?
+                """,
+                (username, chat_type, target),
+            ).fetchone()
+        return row["last_read_message_id"] if row is not None else 0
+
+    def mark_chat_read(
+        self, username: str, chat_type: str, target: str, message_id: int
+    ) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO chat_read_state (
+                    username, chat_type, target, last_read_message_id
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(username, chat_type, target) DO UPDATE SET
+                    last_read_message_id = MAX(
+                        chat_read_state.last_read_message_id,
+                        excluded.last_read_message_id
+                    )
+                """,
+                (username, chat_type, target, message_id),
+            )
+            connection.commit()
+
+    def get_unread_counts(self, username: str) -> Dict[Tuple[str, str], int]:
+        counts: Dict[Tuple[str, str], int] = {}
+        with closing(self._connect()) as connection:
+            general = connection.execute(
+                """
+                SELECT COUNT(*) AS unread_count
+                FROM messages m
+                WHERE m.kind = 'general'
+                  AND m.sender_username != ?
+                  AND m.id > COALESCE((
+                      SELECT last_read_message_id
+                      FROM chat_read_state
+                      WHERE username = ?
+                        AND chat_type = 'general'
+                        AND target = 'general'
+                  ), 0)
+                """,
+                (username, username),
+            ).fetchone()
+            counts[("general", "general")] = general["unread_count"]
+
+            private_rows = connection.execute(
+                """
+                SELECT m.sender_username AS target, COUNT(*) AS unread_count
+                FROM messages m
+                WHERE m.kind = 'private'
+                  AND m.recipient_username = ?
+                  AND m.id > COALESCE((
+                      SELECT last_read_message_id
+                      FROM chat_read_state
+                      WHERE username = ?
+                        AND chat_type = 'private'
+                        AND target = m.sender_username
+                  ), 0)
+                GROUP BY m.sender_username
+                """,
+                (username, username),
+            ).fetchall()
+            for row in private_rows:
+                counts[("private", row["target"])] = row["unread_count"]
+
+            channel_rows = connection.execute(
+                """
+                SELECT c.name AS target, COUNT(m.id) AS unread_count
+                FROM channel_members cm
+                JOIN channels c ON c.id = cm.channel_id
+                LEFT JOIN messages m
+                    ON m.channel_id = c.id
+                   AND m.kind = 'channel'
+                   AND m.sender_username != ?
+                   AND m.id > COALESCE((
+                       SELECT last_read_message_id
+                       FROM chat_read_state
+                       WHERE username = ?
+                         AND chat_type = 'channel'
+                         AND target = c.name
+                   ), 0)
+                WHERE cm.username = ?
+                GROUP BY c.id
+                """,
+                (username, username, username),
+            ).fetchall()
+            for row in channel_rows:
+                counts[("channel", row["target"])] = row["unread_count"]
+
+        return counts
 
     def _get_history(
         self, where_clause: str, parameters: tuple, limit: int
